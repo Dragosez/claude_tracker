@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+
+# Build and Packaging
+build/
+dist/
+*.deb
+*.egg-info/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Config (if any)
+config.json
+cookies.txt
+*.log
