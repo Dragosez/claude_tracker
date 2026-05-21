@@ -63,6 +63,12 @@ class ClaudeTrackerApp:
         self.menu.append(self.item_time)
         
         self.menu.append(Gtk.SeparatorMenuItem())
+        
+        self.item_select_plan = Gtk.MenuItem(label="Select Plan")
+        self.plan_menu = Gtk.Menu()
+        self.item_select_plan.set_submenu(self.plan_menu)
+        self.menu.append(self.item_select_plan)
+        
         item_refresh = Gtk.MenuItem(label="Refresh Data")
         item_refresh.connect("activate", lambda _: self.refresh_data())
         self.menu.append(item_refresh)
@@ -118,10 +124,7 @@ class ClaudeTrackerApp:
             return True
             
         print("DEBUG: Refreshing data via WebKit...")
-        if not self.org_id:
-            self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
-        else:
-            self._fetch_usage()
+        self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
         return True
 
     def _on_orgs_fetched(self, data, error):
@@ -129,9 +132,33 @@ class ClaudeTrackerApp:
             print(f"DEBUG: Org fetch error: {error}")
             return
         if data and len(data) > 0:
-            self.org_id = data[0]["uuid"]
-            save_config({"organization_uuid": self.org_id})
+            for child in self.plan_menu.get_children():
+                self.plan_menu.remove(child)
+
+            valid_orgs = [org["uuid"] for org in data]
+            if self.org_id not in valid_orgs:
+                self.org_id = valid_orgs[0]
+                save_config({"organization_uuid": self.org_id})
+
+            for org in data:
+                name = org.get("name") or "Unknown Plan"
+                uuid = org["uuid"]
+                is_active = (uuid == self.org_id)
+                
+                label = f"{name}{' (Active)' if is_active else ''}"
+                item = Gtk.MenuItem(label=label)
+                item.connect("activate", self._make_org_selector(uuid))
+                self.plan_menu.append(item)
+            
+            self.plan_menu.show_all()
             self._fetch_usage()
+
+    def _make_org_selector(self, uuid):
+        def on_select(_):
+            self.org_id = uuid
+            save_config({"organization_uuid": self.org_id})
+            self.refresh_data()
+        return on_select
 
     def _fetch_usage(self):
         url = f"https://claude.ai/api/organizations/{self.org_id}/usage"
