@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import threading
@@ -144,8 +145,10 @@ class ClaudeTrackerApp:
             print(f"Update check failed: {e}")
 
     def _is_newer(self, latest, current):
-        l = latest.lstrip("vV")
-        c = current.lstrip("vV")
+        # Strip any leading non-digit prefix so tags like "v1.0.2" and
+        # "v.1.0.2" both normalize to "1.0.2"
+        l = re.sub(r"^[^0-9]*", "", latest)
+        c = re.sub(r"^[^0-9]*", "", current)
         try:
             l_parts = [int(p) for p in l.split(".")]
             c_parts = [int(p) for p in c.split(".")]
