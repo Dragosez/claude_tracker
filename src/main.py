@@ -1,7 +1,20 @@
 import os
 import sys
 import time
+import threading
+import subprocess
 from datetime import datetime
+
+import requests
+
+# Ensure prints show up immediately in the terminal
+sys.stdout.reconfigure(line_buffering=True)
+
+if os.geteuid() == 0:
+    print("ERROR: Claude Tracker must NOT be run as root or with sudo.")
+    print("Running as root breaks the WebKit sandbox (causing gray screens) and prevents the app indicator from showing up on your desktop.")
+    print("Please run it as your normal user (e.g. simply type `claude-tracker`).")
+    sys.exit(1)
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -14,6 +27,7 @@ from .config import clear_config, save_config, load_config
 # Constants
 APP_ID = "claude-tracker"
 VERSION = "1.0.1"
+RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
 class ClaudeTrackerApp:
@@ -76,8 +90,13 @@ class ClaudeTrackerApp:
         item_login = Gtk.MenuItem(label="Login / Change Account")
         item_login.connect("activate", lambda _: self.open_login())
         self.menu.append(item_login)
-        
+
         self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.item_update = Gtk.MenuItem(label=f"Version: {VERSION}")
+        self.item_update.connect("activate", self._on_update_clicked)
+        self.menu.append(self.item_update)
+
         item_quit = Gtk.MenuItem(label="Quit")
         item_quit.connect("activate", lambda _: Gtk.main_quit())
         self.menu.append(item_quit)
@@ -96,7 +115,103 @@ class ClaudeTrackerApp:
         GLib.timeout_add_seconds(10 * 60, self.refresh_data)
         GLib.timeout_add_seconds(15, self._ui_heartbeat)
 
+        # Check for updates in background: once at startup, then every 24h
+        # for machines that stay on for days
+        self.update_available = False
+        self.latest_version_data = None
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        GLib.timeout_add_seconds(24 * 3600, self._schedule_update_check)
+
+    def _schedule_update_check(self):
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        return True
+
+    def _check_for_updates(self):
+        try:
+            print(f"Checking for updates at {RELEASES_API_URL}...")
+            response = requests.get(RELEASES_API_URL, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                latest_tag = data.get("tag_name", "")
+                if latest_tag and self._is_newer(latest_tag, VERSION):
+                    print(f"Update available: {VERSION} -> {latest_tag}")
+                    self.update_available = True
+                    self.latest_version_data = data
+                    GLib.idle_add(lambda: self.item_update.set_label(f"Update to {latest_tag} Available!"))
+                else:
+                    print(f"Already on latest version: {VERSION}")
+        except Exception as e:
+            print(f"Update check failed: {e}")
+
+    def _is_newer(self, latest, current):
+        l = latest.lstrip("vV")
+        c = current.lstrip("vV")
+        try:
+            l_parts = [int(p) for p in l.split(".")]
+            c_parts = [int(p) for p in c.split(".")]
+            return l_parts > c_parts
+        except ValueError:
+            return l != c
+
+    def _on_update_clicked(self, _):
+        if not self.update_available or not self.latest_version_data:
+            return
+
+        version_name = self.latest_version_data["tag_name"]
+        dialog = Gtk.MessageDialog(
+            transient_for=None,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=f"New version {version_name} is available!"
+        )
+        dialog.format_secondary_text("Would you like to download and install it now?")
+        response = dialog.run()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.YES:
+            threading.Thread(target=self._perform_update, daemon=True).start()
+
+    def _perform_update(self):
+        try:
+            GLib.idle_add(lambda: self.item_update.set_label("Updating..."))
+
+            assets = self.latest_version_data.get("assets", [])
+            deb_url = next((a["browser_download_url"] for a in assets if a["name"].endswith(".deb")), None)
+            if not deb_url:
+                raise Exception("No .deb package found in the latest release.")
+
+            print(f"Downloading update from {deb_url}...")
+            temp_path = "/tmp/claude-tracker-update.deb"
+            with requests.get(deb_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(temp_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+            print("Installing update via pkexec...")
+            process = subprocess.Popen(["pkexec", "dpkg", "-i", temp_path])
+            process.wait()
+
+            if process.returncode == 0:
+                print("Update installed successfully. Restarting...")
+                # Prefer the system launcher so we pick up the freshly
+                # installed copy even if this process was started from a
+                # user-local install
+                launcher = "/usr/bin/claude-tracker"
+                if os.path.exists(launcher):
+                    os.execv(launcher, [launcher])
+                else:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                raise Exception(f"Installation failed with exit code {process.returncode}")
+        except Exception as e:
+            print(f"Update error: {e}")
+            GLib.idle_add(lambda: self.item_update.set_label(f"Update Failed: {str(e)[:30]}..."))
+
     def _ui_heartbeat(self):
+        # Toggle a trailing space to force the indicator label to redraw;
+        # some shells drop the label after suspend/panel restarts otherwise
         label = self.current_label
         new_label = label.rstrip(" ") + (" " if not label.endswith(" ") else "")
         self._safe_set_label(new_label)
@@ -169,7 +284,7 @@ class ClaudeTrackerApp:
         try:
             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
             return dt.astimezone().strftime('%H:%M')
-        except:
+        except Exception:
             return timestamp[11:16]
 
     def _on_usage_fetched(self, data, error):

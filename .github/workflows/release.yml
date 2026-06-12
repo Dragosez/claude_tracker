@@ -1,0 +1,56 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build .deb package
+        run: |
+          # Pass the tag name (e.g., v1.0.2) to the make command
+          make deb VERSION=${{ github.ref_name }}
+
+      - name: Commit version bump
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add src/main.py
+          # Only commit if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "Bump version to ${{ github.ref_name }} [skip ci]"
+            # Pull to avoid conflicts and push back to default branch
+            git pull --rebase origin ${{ github.event.repository.default_branch }}
+            git push origin HEAD:${{ github.event.repository.default_branch }}
+          else
+            echo "No version changes to commit."
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: claude-tracker.deb
+          body: |
+            ## Claude Tracker (Native Linux)
+
+            Install this .deb package to get the native topbar indicator for Claude.ai usage.
+
+            ### Installation
+            1. Download `claude-tracker.deb`
+            2. Open with Software Install or run `sudo apt install ./claude-tracker.deb`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

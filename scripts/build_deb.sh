@@ -2,11 +2,14 @@
 set -e
 
 APP_NAME="claude-tracker"
-VERSION="1.0.0"
 
-# If a version argument is provided, use it
+# If a version argument is provided, use it and sync src/main.py to match
 if [ ! -z "$1" ]; then
     VERSION=$(echo $1 | sed 's/^[^0-9]*//')
+    sed -i "s/^VERSION\s*=\s*\".*\"/VERSION = \"$VERSION\"/" src/main.py
+else
+    # Otherwise read the version from src/main.py (single source of truth)
+    VERSION=$(grep -E "^VERSION\s*=" src/main.py | head -n 1 | cut -d '"' -f 2)
 fi
 
 BUILD_DIR="build/deb"
@@ -26,7 +29,7 @@ cp -r src run.py $STAGED_DIR/opt/$APP_NAME/
 # Create launcher script
 cat <<EOF > $STAGED_DIR/usr/bin/$APP_NAME
 #!/bin/bash
-python3 /opt/$APP_NAME/run.py "\$@"
+/usr/bin/python3 /opt/$APP_NAME/run.py "\$@"
 EOF
 chmod +x $STAGED_DIR/usr/bin/$APP_NAME
 
@@ -52,8 +55,8 @@ Version: $VERSION
 Section: utils
 Priority: optional
 Architecture: all
-Maintainer: Dragos <dragos@example.com>
-Depends: python3, python3-gi, gir1.2-ayatanaappindicator3-0.1, gir1.2-webkit2-4.1, python3-requests
+Maintainer: Dragos <dragos2992@yahoo.com>
+Depends: python3, python3-gi, gir1.2-ayatanaappindicator3-0.1, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0, python3-requests
 Description: Native Linux topbar indicator for Claude.ai usage.
  Supports wide horizontal text in Ubuntu/GNOME.
 EOF

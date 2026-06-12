@@ -1,6 +1,9 @@
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('WebKit2', '4.1')
+try:
+    gi.require_version('WebKit2', '4.1')
+except ValueError:
+    gi.require_version('WebKit2', '4.0')
 from gi.repository import Gtk, WebKit2, GLib
 from .config import save_config
 import json
@@ -47,10 +50,23 @@ class ClaudeSession(Gtk.Window):
         storage_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
         os.makedirs(os.path.dirname(storage_path), exist_ok=True)
         cookie_manager.set_persistent_storage(storage_path, WebKit2.CookiePersistentStorage.TEXT)
+        cookie_manager.set_accept_policy(WebKit2.CookieAcceptPolicy.ALWAYS)
         
         settings = self.webview.get_settings()
-        # Stable Chrome on Linux UA
-        settings.set_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        
+        # Check if we are running on an older WebKit engine (like Ubuntu 20.04)
+        # WebKitGTK 2.38 is roughly Safari 16.4, which supports regex named capture groups.
+        is_legacy = WebKit2.get_major_version() == 2 and WebKit2.get_minor_version() < 38
+        
+        if is_legacy:
+            # Firefox ESR UA to force legacy bundles for older WebKit engines
+            settings.set_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0")
+            self.spoof_type = 'firefox'
+        else:
+            # Modern WebKit engines can handle modern JS. Let it use its native Safari-like UA.
+            # Just set spoof_type to minimal.
+            self.spoof_type = 'minimal'
+            
         settings.set_enable_javascript(True)
         settings.set_enable_webgl(True)
         settings.set_enable_developer_extras(True)
@@ -69,18 +85,18 @@ class ClaudeSession(Gtk.Window):
         settings.set_allow_universal_access_from_file_urls(True)
         settings.set_allow_file_access_from_file_urls(True)
         
-        try:
-            settings.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.ALWAYS)
-        except:
-            pass
-        
         self.webview.connect("load-changed", self._on_load_changed)
+        self.webview.connect("load-failed", self._on_load_failed)
         self.webview.connect("notify::uri", self._on_uri_changed)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.add(self.webview)
         self.add(scrolled)
         self.connect("delete-event", self._on_delete_event)
+
+    def _on_load_failed(self, webview, load_event, failing_uri, error):
+        print(f"DEBUG: WebKit Load Failed for {failing_uri}: {error.message}")
+        return False
 
     def _clear_cache_and_reload(self):
         print("DEBUG: Clearing session cache, cookies and reloading...")
@@ -138,18 +154,18 @@ class ClaudeSession(Gtk.Window):
             self._mark_ready()
 
     def _setup_user_scripts(self):
-        script_content = """
-        (function() {
-            // 1. Trusted Types
-            if (window.trustedTypes && !window.trustedTypes.defaultPolicy) {
-                try {
-                    window.trustedTypes.createPolicy('default', {
-                        createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s
-                    });
-                } catch (e) {}
-            }
-
-            // 2. Normality Spoofing
+        if hasattr(self, 'spoof_type') and self.spoof_type == 'firefox':
+            spoof_script = """
+            try {
+                Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32', configurable: true });
+                Object.defineProperty(navigator, 'vendor', { get: () => '', configurable: true });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
+            } catch (e) {}
+            """
+        else:
+            spoof_script = """
             try {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
@@ -157,41 +173,45 @@ class ClaudeSession(Gtk.Window):
                 Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.', configurable: true });
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
             } catch (e) {}
-
-            // 3. Chrome Polyfill
+            
             if (!window.chrome) {
                 window.chrome = {
-                    runtime: {},
-                    app: {},
-                    csi: function() {},
-                    loadTimes: function() {}
+                    runtime: {}, app: {}, csi: function() {}, loadTimes: function() {}
                 };
             }
+            """
 
-            // 4. Fix for 'Blocked a frame' error
-            const originalPostMessage = window.postMessage;
-            window.postMessage = function(message, targetOrigin, transfer) {
-                try {
-                    return originalPostMessage.call(this, message, targetOrigin, transfer);
-                } catch (e) {
-                    if (targetOrigin !== '*') {
-                        return originalPostMessage.call(this, message, '*', transfer);
-                    }
-                    throw e;
-                }
-            };
-            
-            window.addEventListener('error', function(e) {
-                if (e.message && e.message.includes('Blocked a frame')) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                }
-            }, true);
-            
-            if (window.opener) {
-                try { window.opener = null; } catch(e) {}
-            }
-        })();
+        script_content = f"""
+        (function() {{
+            {spoof_script}
+
+            if (window === window.top) {{
+                if (window.trustedTypes && !window.trustedTypes.defaultPolicy) {{
+                    try {{
+                        window.trustedTypes.createPolicy('default', {{
+                            createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s
+                        }});
+                    }} catch (e) {{}}
+                }}
+
+                const originalPostMessage = window.postMessage;
+                window.postMessage = function(message, targetOrigin, transfer) {{
+                    try {{ return originalPostMessage.call(this, message, targetOrigin, transfer); }}
+                    catch (e) {{
+                        if (targetOrigin !== '*') return originalPostMessage.call(this, message, '*', transfer);
+                        throw e;
+                    }}
+                }};
+                
+                window.addEventListener('error', function(e) {{
+                    if (e.message && e.message.includes('Blocked a frame')) {{
+                        e.preventDefault(); e.stopPropagation();
+                    }}
+                }}, true);
+                
+                if (window.opener) {{ try {{ window.opener = null; }} catch(e) {{}} }}
+            }}
+        }})();
         """
         user_script = WebKit2.UserScript.new(
             script_content,
