@@ -27,7 +27,7 @@ from .config import clear_config, save_config, load_config
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
