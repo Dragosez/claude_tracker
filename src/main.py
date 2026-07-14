@@ -31,6 +31,15 @@ VERSION = "1.0.3"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
+MODEL_MAPPINGS = {
+    "seven_day_omelette": "Claude Design",
+    "seven_day_sonnet": "Sonnet",
+    "seven_day_fable": "Fable",
+    "seven_day_opus": "Opus",
+    "seven_day_haiku": "Haiku",
+    "iguana_necktie": "Fable",
+}
+
 class ClaudeTrackerApp:
     def __init__(self):
         self.is_fetching = False
@@ -55,13 +64,7 @@ class ClaudeTrackerApp:
         self.item_usage_7d.set_sensitive(False)
         self.menu.append(self.item_usage_7d)
         
-        self.item_sonnet = Gtk.MenuItem(label="Sonnet only: ...")
-        self.item_sonnet.set_sensitive(False)
-        self.menu.append(self.item_sonnet)
-        
-        self.item_design = Gtk.MenuItem(label="Claude Design: ...")
-        self.item_design.set_sensitive(False)
-        self.menu.append(self.item_design)
+        self.dynamic_model_items = {}
         
         self.item_routines = Gtk.MenuItem(label="Daily routines: ...")
         self.item_routines.set_sensitive(False)
@@ -282,12 +285,20 @@ class ClaudeTrackerApp:
         url = f"https://claude.ai/api/organizations/{self.org_id}/usage"
         self.session.fetch_json(url, self._on_usage_fetched)
 
-    def _format_time(self, timestamp):
+    def _format_time(self, timestamp, include_day=False):
         if not timestamp: return None
         try:
             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            return dt.astimezone().strftime('%H:%M')
+            dt_local = dt.astimezone()
+            if include_day:
+                weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                day_name = weekdays[dt_local.weekday()]
+                return f"{day_name} {dt_local.strftime('%H:%M')}"
+            else:
+                return dt_local.strftime('%H:%M')
         except Exception:
+            if include_day:
+                return timestamp
             return timestamp[11:16]
 
     def _on_usage_fetched(self, data, error):
@@ -296,6 +307,9 @@ class ClaudeTrackerApp:
             self._safe_set_label("Auth Error")
             return
         
+        if not data:
+            data = {}
+
         try:
             # 1. Current Session (5h)
             five_hour = data.get("five_hour", {})
@@ -316,33 +330,65 @@ class ClaudeTrackerApp:
             if seven_day:
                 u7 = seven_day.get("utilization", 0)
                 p7 = int(u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else int(u7)
-                r7 = self._format_time(seven_day.get("resets_at"))
+                r7 = self._format_time(seven_day.get("resets_at"), include_day=True)
                 self.item_usage_7d.set_label(f"All models (Weekly): {p7}%" + (f" ({r7})" if r7 else ""))
                 
-            # 3. Sonnet Only (Mapping to seven_day_sonnet)
-            sonnet = data.get("seven_day_sonnet")
-            if sonnet:
-                us = sonnet.get("utilization", 0)
-                ps = int(us * 100) if isinstance(us, float) and us <= 1.0 else int(us)
-                rs = self._format_time(sonnet.get("resets_at"))
-                self.item_sonnet.set_label(f"Sonnet only: {ps}%" + (f" ({rs})" if rs else ""))
-                self.item_sonnet.show()
-            else:
-                self.item_sonnet.hide()
+            # 3. Dynamic Models (Mapping any seven_day_* keys and iguana_necktie)
+            model_keys = [k for k in data.keys() if k.startswith("seven_day_") or k == "iguana_necktie"]
+            
+            # Filter keys to only show Fable or models with utilization > 0
+            active_model_keys = []
+            for k in model_keys:
+                model_data = data[k] or {}
+                util = model_data.get("utilization", 0)
+                if k in ("iguana_necktie", "seven_day_fable") or util > 0:
+                    active_model_keys.append(k)
+            
+            # Sort alphabetically by friendly name
+            def get_name(k):
+                if k in MODEL_MAPPINGS:
+                    return MODEL_MAPPINGS[k]
+                if k.startswith("seven_day_"):
+                    return k[10:].replace('_', ' ').title()
+                return k.replace('_', ' ').title()
+            
+            active_model_keys.sort(key=get_name)
+            
+            # Remove any dynamic menu items that are no longer active
+            keys_to_remove = []
+            for key, item in self.dynamic_model_items.items():
+                if key not in active_model_keys:
+                    self.menu.remove(item)
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                del self.dynamic_model_items[key]
                 
-            # 4. Claude Design (Mapping to seven_day_omelette)
-            design = data.get("seven_day_omelette")
-            if design:
-                ud = design.get("utilization", 0)
-                pd = int(ud * 100) if isinstance(ud, float) and ud <= 1.0 else int(ud)
-                rsd = self._format_time(design.get("resets_at"))
-                self.item_design.set_label(f"Claude Design: {pd}%" + (f" ({rsd})" if rsd else ""))
-                self.item_design.show()
-            else:
-                self.item_design.hide()
+            # Update or create menu items for the active keys
+            children = self.menu.get_children()
+            idx_7d = children.index(self.item_usage_7d)
+            
+            for i, key in enumerate(active_model_keys):
+                model_data = data[key] or {}
+                u = model_data.get("utilization", 0)
+                p = int(u * 100) if isinstance(u, float) and u <= 1.0 else int(u)
+                r = self._format_time(model_data.get("resets_at"), include_day=True)
                 
-            # 5. Routine Runs (Mapping if available, otherwise hide)
-            routines = data.get("routine_runs") or data.get("iguana_necktie") # Fallback check
+                model_name = get_name(key)
+                label_text = f"{model_name}: {p}%" + (f" ({r})" if r else "")
+                
+                if key in self.dynamic_model_items:
+                    self.dynamic_model_items[key].set_label(label_text)
+                    self.dynamic_model_items[key].show()
+                else:
+                    item = Gtk.MenuItem(label=label_text)
+                    item.set_sensitive(False)
+                    insert_idx = idx_7d + 1 + i
+                    self.menu.insert(item, insert_idx)
+                    self.dynamic_model_items[key] = item
+                    item.show()
+                
+            # 4. Routine Runs (Mapping if available, otherwise hide)
+            routines = data.get("routine_runs")
             if routines and isinstance(routines, dict):
                 curr = routines.get("current", 0)
                 lim = routines.get("limit", 15)
