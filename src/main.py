@@ -28,7 +28,7 @@ from .usage import extract_model_limits
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
