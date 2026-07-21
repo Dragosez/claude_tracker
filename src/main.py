@@ -24,21 +24,13 @@ from gi.repository import Gtk, AyatanaAppIndicator3 as AppIndicator, GLib, Gio
 
 from .auth import get_session
 from .config import clear_config, save_config, load_config
+from .usage import extract_model_limits
 
 # Constants
 APP_ID = "claude-tracker"
 VERSION = "1.0.4"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
-
-MODEL_MAPPINGS = {
-    "seven_day_omelette": "Claude Design",
-    "seven_day_sonnet": "Sonnet",
-    "seven_day_fable": "Fable",
-    "seven_day_opus": "Opus",
-    "seven_day_haiku": "Haiku",
-    "iguana_necktie": "Fable",
-}
 
 class ClaudeTrackerApp:
     def __init__(self):
@@ -333,27 +325,11 @@ class ClaudeTrackerApp:
                 r7 = self._format_time(seven_day.get("resets_at"), include_day=True)
                 self.item_usage_7d.set_label(f"All models (Weekly): {p7}%" + (f" ({r7})" if r7 else ""))
                 
-            # 3. Dynamic Models (Mapping any seven_day_* keys and iguana_necktie)
-            model_keys = [k for k in data.keys() if k.startswith("seven_day_") or k == "iguana_necktie"]
-            
-            # Filter keys to only show Fable or models with utilization > 0
-            active_model_keys = []
-            for k in model_keys:
-                model_data = data[k] or {}
-                util = model_data.get("utilization", 0)
-                if k in ("iguana_necktie", "seven_day_fable") or util > 0:
-                    active_model_keys.append(k)
-            
-            # Sort alphabetically by friendly name
-            def get_name(k):
-                if k in MODEL_MAPPINGS:
-                    return MODEL_MAPPINGS[k]
-                if k.startswith("seven_day_"):
-                    return k[10:].replace('_', ' ').title()
-                return k.replace('_', ' ').title()
-            
-            active_model_keys.sort(key=get_name)
-            
+            # 3. Per-model usage (modern `limits` array, legacy seven_day_*
+            # and iguana_necktie keys as fallback)
+            model_rows = extract_model_limits(data)
+            active_model_keys = [row["key"] for row in model_rows]
+
             # Remove any dynamic menu items that are no longer active
             keys_to_remove = []
             for key, item in self.dynamic_model_items.items():
@@ -362,20 +338,16 @@ class ClaudeTrackerApp:
                     keys_to_remove.append(key)
             for key in keys_to_remove:
                 del self.dynamic_model_items[key]
-                
-            # Update or create menu items for the active keys
+
+            # Update or create menu items for the active rows
             children = self.menu.get_children()
             idx_7d = children.index(self.item_usage_7d)
-            
-            for i, key in enumerate(active_model_keys):
-                model_data = data[key] or {}
-                u = model_data.get("utilization", 0)
-                p = int(u * 100) if isinstance(u, float) and u <= 1.0 else int(u)
-                r = self._format_time(model_data.get("resets_at"), include_day=True)
-                
-                model_name = get_name(key)
-                label_text = f"{model_name}: {p}%" + (f" ({r})" if r else "")
-                
+
+            for i, row in enumerate(model_rows):
+                key = row["key"]
+                r = self._format_time(row["resets_at"], include_day=True)
+                label_text = f"{row['name']}: {row['percent']}%" + (f" ({r})" if r else "")
+
                 if key in self.dynamic_model_items:
                     self.dynamic_model_items[key].set_label(label_text)
                     self.dynamic_model_items[key].show()
