@@ -26,6 +26,7 @@ from .auth import get_session
 from .cleanup import remove_legacy_user_install
 from .config import clear_config, save_config, load_config
 from .usage import extract_model_limits
+from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
@@ -36,6 +37,7 @@ ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "c
 class ClaudeTrackerApp:
     def __init__(self):
         self.is_fetching = False
+        self.last_fetch_completed = time.time()
         self.current_label = "Login Required"
         self.org_id = (load_config() or {}).get("organization_uuid")
         
@@ -233,15 +235,27 @@ class ClaudeTrackerApp:
         self.session.present() # Bring to front
 
     def refresh_data(self):
-        if not self.session.is_ready:
-            print("DEBUG: Session not ready yet, skipping refresh.")
-            return True
-            
-        print("DEBUG: Refreshing data via WebKit...")
-        self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
+        # Never let an exception escape: this runs from a GLib timer and a
+        # raised exception would remove the timer, killing refreshes for good
+        try:
+            if not self.session.is_ready:
+                print("DEBUG: Session not ready yet, skipping refresh.")
+                return True
+
+            if is_stalled(self.last_fetch_completed, time.time()):
+                print("DEBUG: No fetch completed recently; recovering WebKit session...")
+                self.last_fetch_completed = time.time()
+                self.session.recover()
+                return True
+
+            print("DEBUG: Refreshing data via WebKit...")
+            self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
+        except Exception as e:
+            print(f"DEBUG: refresh_data error: {e}")
         return True
 
     def _on_orgs_fetched(self, data, error):
+        self.last_fetch_completed = time.time()
         if error:
             print(f"DEBUG: Org fetch error: {error}")
             return
@@ -295,6 +309,7 @@ class ClaudeTrackerApp:
             return timestamp[11:16]
 
     def _on_usage_fetched(self, data, error):
+        self.last_fetch_completed = time.time()
         if error:
             print(f"DEBUG: Usage fetch error: {error}")
             self._safe_set_label("Auth Error")

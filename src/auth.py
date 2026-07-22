@@ -88,6 +88,7 @@ class ClaudeSession(Gtk.Window):
         self.webview.connect("load-changed", self._on_load_changed)
         self.webview.connect("load-failed", self._on_load_failed)
         self.webview.connect("notify::uri", self._on_uri_changed)
+        self.webview.connect("web-process-terminated", self._on_web_process_terminated)
 
         scrolled = Gtk.ScrolledWindow()
         scrolled.add(self.webview)
@@ -97,6 +98,35 @@ class ClaudeSession(Gtk.Window):
     def _on_load_failed(self, webview, load_event, failing_uri, error):
         print(f"DEBUG: WebKit Load Failed for {failing_uri}: {error.message}")
         return False
+
+    def _on_web_process_terminated(self, webview, reason):
+        # The web process runs the page JS that fetch_json injects; if it
+        # dies (crash, memory pressure) every future fetch silently never
+        # calls back, freezing the UI on stale data until recovery
+        print(f"DEBUG: WebKit web process terminated ({reason}). Recovering session...")
+        self.recover()
+
+    def recover(self):
+        """Reload the page after the web process died or the JS bridge went
+        silent. Fails pending fetch callbacks and drops readiness until the
+        page finishes loading again (which re-triggers a data refresh)."""
+        pending = list(self.callbacks.values())
+        self.callbacks.clear()
+        for callback in pending:
+            try:
+                callback(None, "webkit session recovering")
+            except Exception as e:
+                print(f"DEBUG: Pending callback failed during recover: {e}")
+        self.is_ready = False
+
+        def _reload():
+            uri = self.webview.get_uri()
+            if uri and "claude.ai" in uri:
+                self.webview.reload()
+            else:
+                self.webview.load_uri("https://claude.ai")
+            return False
+        GLib.idle_add(_reload)
 
     def _clear_cache_and_reload(self):
         print("DEBUG: Clearing session cache, cookies and reloading...")
