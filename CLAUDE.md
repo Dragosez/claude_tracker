@@ -34,6 +34,10 @@ The app refuses to run as root (breaks the WebKit sandbox and the tray icon). A 
 
 **UI quirk:** `_ui_heartbeat` toggles a trailing space on the panel label every 15s because some GNOME shells drop indicator labels after suspend/panel restarts.
 
+## Install layout (two-install trap)
+
+There are two install paths with different owners: `make install` copies to `~/.local/share/claude-tracker` with user-level launcher/autostart/app-menu entries, while the .deb installs to `/opt/claude-tracker` with system-level entries (`/usr/bin/claude-tracker`, `/etc/xdg/autostart`, `/usr/share/applications`). If both exist, the user-level `.desktop` entries **shadow** the system ones (XDG precedence), so logins keep launching the stale `~/.local` copy even after the auto-updater updates `/opt` — the symptom is a persistent "Update available" banner. `src/cleanup.py:remove_legacy_user_install()` self-heals this at startup: when the app runs from `/opt`, it deletes the user-level copy and any `.desktop` entries pointing at it. Don't use `make install` on a machine that has the .deb.
+
 ## Versioning & releases
 
 - `VERSION` in `src/main.py` is the single source of truth.

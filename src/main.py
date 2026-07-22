@@ -23,6 +23,7 @@ gi.require_version('AyatanaAppIndicator3', '0.1')
 from gi.repository import Gtk, AyatanaAppIndicator3 as AppIndicator, GLib, Gio
 
 from .auth import get_session
+from .cleanup import remove_legacy_user_install
 from .config import clear_config, save_config, load_config
 from .usage import extract_model_limits
 
@@ -375,6 +376,12 @@ class ClaudeTrackerApp:
             print(f"DEBUG: UI update error: {e}")
 
 def main():
+    try:
+        removed = remove_legacy_user_install()
+        for path in removed:
+            print(f"Removed stale user-level install artifact: {path}")
+    except Exception as e:
+        print(f"Legacy install cleanup failed: {e}")
     app = ClaudeTrackerApp()
     Gtk.main()
 
