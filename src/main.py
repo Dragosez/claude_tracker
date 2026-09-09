@@ -25,6 +25,7 @@ from gi.repository import Gtk, AyatanaAppIndicator3 as AppIndicator, GLib, Gio
 from .auth import get_session
 from .cleanup import remove_legacy_user_install
 from .config import clear_config, save_config, load_config
+from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
 from .watchdog import is_stalled
 
@@ -331,7 +332,9 @@ class ClaudeTrackerApp:
                 label = f"{pct}%"
 
             self._safe_set_label(label)
-            self.item_usage.set_label(f"Current session: {pct}%" + (f" (Resets {reset_str})" if reset_str != "..." else ""))
+            pace_5h = compute_session_pace(pct, five_hour.get("resets_at"), fetched_at=self.last_fetch_completed)
+            ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
+            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else ""))
             
             # 2. All Models (Weekly)
             seven_day = data.get("seven_day", {})
@@ -339,11 +342,13 @@ class ClaudeTrackerApp:
                 u7 = seven_day.get("utilization", 0)
                 p7 = int(u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else int(u7)
                 r7 = self._format_time(seven_day.get("resets_at"), include_day=True)
-                self.item_usage_7d.set_label(f"All models (Weekly): {p7}%" + (f" ({r7})" if r7 else ""))
+                pace_7d = compute_weekly_pace(p7, seven_day.get("resets_at"), fetched_at=self.last_fetch_completed)
+                ahead_7d = " (ahead)" if pace_7d and pace_7d.ahead else ""
+                self.item_usage_7d.set_label(f"All models (Weekly): {p7}%{ahead_7d}" + (f" ({r7})" if r7 else ""))
                 
             # 3. Per-model usage (modern `limits` array, legacy seven_day_*
             # and iguana_necktie keys as fallback)
-            model_rows = extract_model_limits(data)
+            model_rows = extract_model_limits(data, fetched_at=self.last_fetch_completed)
             active_model_keys = [row["key"] for row in model_rows]
 
             # Remove any dynamic menu items that are no longer active
@@ -362,7 +367,9 @@ class ClaudeTrackerApp:
             for i, row in enumerate(model_rows):
                 key = row["key"]
                 r = self._format_time(row["resets_at"], include_day=True)
-                label_text = f"{row['name']}: {row['percent']}%" + (f" ({r})" if r else "")
+                pace_row = row.get("pace")
+                ahead_row = " (ahead)" if pace_row and pace_row.ahead else ""
+                label_text = f"{row['name']}: {row['percent']}%{ahead_row}" + (f" ({r})" if r else "")
 
                 if key in self.dynamic_model_items:
                     self.dynamic_model_items[key].set_label(label_text)

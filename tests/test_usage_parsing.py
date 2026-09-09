@@ -96,6 +96,25 @@ class ExtractModelLimitsLegacyFormat(unittest.TestCase):
         rows = extract_model_limits(data)
         self.assertEqual([r["name"] for r in rows], ["Opus", "Sonnet"])
 
+    def test_model_pace_computation_attached(self):
+        data = modern_payload()
+        # In modern_payload, Fable has percent 13, resets_at "2026-07-25T20:00:00+00:00"
+        # Let's mock fetched_at to be 5 days into the 7-day cycle (2 days before reset)
+        from datetime import datetime, timezone
+        reset_ts = datetime.fromisoformat("2026-07-25T20:00:00+00:00").timestamp()
+        fetched_at = reset_ts - 2 * 86400.0  # 5 days elapsed (~71.4% expected)
+        rows = extract_model_limits(data, fetched_at=fetched_at)
+        self.assertEqual(len(rows), 1)
+        pace_res = rows[0]["pace"]
+        self.assertIsNotNone(pace_res)
+        self.assertFalse(pace_res.ahead)
+
+        # If Fable is at 95% at the same point, it should be ahead (95 - 71.4 = 23.6% >= 15%)
+        data["limits"][2]["percent"] = 95
+        rows_ahead = extract_model_limits(data, fetched_at=fetched_at)
+        self.assertTrue(rows_ahead[0]["pace"].ahead)
+
 
 if __name__ == "__main__":
     unittest.main()
+

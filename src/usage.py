@@ -1,5 +1,7 @@
 """Parsing helpers for the claude.ai /usage API response."""
 
+from .pace import compute_weekly_pace
+
 # Friendly names for legacy per-model usage keys
 MODEL_MAPPINGS = {
     "seven_day_omelette": "Claude Design",
@@ -28,10 +30,10 @@ def _to_percent(utilization):
     return int(utilization)
 
 
-def extract_model_limits(data):
+def extract_model_limits(data, fetched_at=None):
     """Return per-model usage rows from a /usage API response.
 
-    Each row is {"key", "name", "percent", "resets_at"}, sorted by name.
+    Each row is {"key", "name", "percent", "resets_at", "pace"}, sorted by name.
 
     Modern responses report model usage as scoped entries in the `limits`
     array (the legacy seven_day_*/iguana_necktie keys are null there);
@@ -45,11 +47,14 @@ def extract_model_limits(data):
         name = model.get("display_name")
         if not name:
             continue
+        pct = int(entry.get("percent") or 0)
+        resets_at = entry.get("resets_at")
         rows.append({
             "key": f"scoped:{name}",
             "name": name,
-            "percent": int(entry.get("percent") or 0),
-            "resets_at": entry.get("resets_at"),
+            "percent": pct,
+            "resets_at": resets_at,
+            "pace": compute_weekly_pace(pct, resets_at, fetched_at=fetched_at),
         })
 
     if not rows:
@@ -61,11 +66,13 @@ def extract_model_limits(data):
             percent = _to_percent(value.get("utilization", 0))
             if percent <= 0 and key not in ALWAYS_SHOW_KEYS:
                 continue
+            resets_at = value.get("resets_at")
             rows.append({
                 "key": key,
                 "name": _legacy_name(key),
                 "percent": percent,
-                "resets_at": value.get("resets_at"),
+                "resets_at": resets_at,
+                "pace": compute_weekly_pace(percent, resets_at, fetched_at=fetched_at),
             })
 
     rows.sort(key=lambda r: r["name"])
