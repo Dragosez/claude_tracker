@@ -44,6 +44,7 @@ ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "c
 class ClaudeTrackerApp:
     def __init__(self):
         self.is_fetching = False
+        self.is_fetching_cswap = False
         self.last_fetch_completed = time.time()
         self.current_label = "Login Required"
         
@@ -132,16 +133,17 @@ class ClaudeTrackerApp:
         # Initialize Session
         self.session = get_session(on_success=self.refresh_data)
         
-        # Automatically start the engine if we likely have auth
+        # Automatically start the engine if we likely have auth (only if cswap is not used)
         cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
-        if self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0):
-            self.session.ensure_started()
+        if not is_cswap_available():
+            if self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0):
+                self.session.ensure_started()
 
         # Periodic updates: cswap accounts poll every 60s, WebKit every 10m
         if is_cswap_available():
             GLib.timeout_add_seconds(60, self.refresh_data)
-
-        GLib.timeout_add_seconds(10 * 60, self.refresh_data)
+        else:
+            GLib.timeout_add_seconds(10 * 60, self.refresh_data)
         GLib.timeout_add_seconds(15, self._ui_heartbeat)
 
         # Check for updates in background: once at startup, then every 24h
@@ -270,7 +272,10 @@ class ClaudeTrackerApp:
     def refresh_data(self):
         try:
             if is_cswap_available():
-                fetch_cswap_accounts_async(self._on_cswap_accounts_fetched)
+                if not self.is_fetching_cswap:
+                    self.is_fetching_cswap = True
+                    fetch_cswap_accounts_async(self._on_cswap_accounts_fetched)
+                return True
 
             if not self.session.is_ready:
                 return True
@@ -291,6 +296,7 @@ class ClaudeTrackerApp:
         GLib.idle_add(self._apply_cswap_accounts, accounts, error)
 
     def _apply_cswap_accounts(self, accounts, error):
+        self.is_fetching_cswap = False
         if error or not accounts:
             if error:
                 print(f"DEBUG: cswap fetch error: {error}")
