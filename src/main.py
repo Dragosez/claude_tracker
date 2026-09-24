@@ -25,6 +25,12 @@ from gi.repository import Gtk, AyatanaAppIndicator3 as AppIndicator, GLib, Gio
 from .auth import get_session
 from .cleanup import remove_legacy_user_install
 from .config import clear_config, save_config, load_config
+from .cswap import (
+    is_cswap_available,
+    fetch_cswap_accounts_async,
+    cswap_account_to_tracker_payload,
+    format_account_label,
+)
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
 from .watchdog import is_stalled
@@ -40,7 +46,12 @@ class ClaudeTrackerApp:
         self.is_fetching = False
         self.last_fetch_completed = time.time()
         self.current_label = "Login Required"
-        self.org_id = (load_config() or {}).get("organization_uuid")
+        
+        cfg = load_config() or {}
+        self.org_id = cfg.get("organization_uuid")
+        self.pinned_account = cfg.get("pinned_account")
+        self.follow_cli_active = cfg.get("follow_cli_active", True)
+        self.cswap_accounts = []
         
         self.indicator = AppIndicator.Indicator.new(
             APP_ID,
@@ -52,6 +63,11 @@ class ClaudeTrackerApp:
         
         # Build menu
         self.menu = Gtk.Menu()
+
+        self.item_account_header = Gtk.MenuItem(label="Account: ...")
+        self.item_account_header.set_sensitive(False)
+        self.menu.append(self.item_account_header)
+
         self.item_usage = Gtk.MenuItem(label="Current session: ...")
         self.item_usage.set_sensitive(False)
         self.menu.append(self.item_usage)
@@ -77,6 +93,11 @@ class ClaudeTrackerApp:
         self.menu.append(self.item_time)
         
         self.menu.append(Gtk.SeparatorMenuItem())
+
+        self.item_accounts = Gtk.MenuItem(label="Accounts")
+        self.accounts_menu = Gtk.Menu()
+        self.item_accounts.set_submenu(self.accounts_menu)
+        self.menu.append(self.item_accounts)
         
         self.item_select_plan = Gtk.MenuItem(label="Select Plan")
         self.plan_menu = Gtk.Menu()
@@ -87,9 +108,9 @@ class ClaudeTrackerApp:
         item_refresh.connect("activate", lambda _: self.refresh_data())
         self.menu.append(item_refresh)
         
-        item_login = Gtk.MenuItem(label="Login / Change Account")
-        item_login.connect("activate", lambda _: self.open_login())
-        self.menu.append(item_login)
+        self.item_login = Gtk.MenuItem(label="Login / Change Account")
+        self.item_login.connect("activate", lambda _: self.open_login())
+        self.menu.append(self.item_login)
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
@@ -101,6 +122,11 @@ class ClaudeTrackerApp:
         item_quit.connect("activate", lambda _: Gtk.main_quit())
         self.menu.append(item_quit)
         self.menu.show_all()
+        
+        # Hide accounts items until cswap accounts are discovered
+        self.item_account_header.hide()
+        self.item_accounts.hide()
+
         self.indicator.set_menu(self.menu)
 
         # Initialize Session
@@ -111,7 +137,10 @@ class ClaudeTrackerApp:
         if self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0):
             self.session.ensure_started()
 
-        # Periodic updates - refresh_data will skip if session not ready
+        # Periodic updates: cswap accounts poll every 60s, WebKit every 10m
+        if is_cswap_available():
+            GLib.timeout_add_seconds(60, self.refresh_data)
+
         GLib.timeout_add_seconds(10 * 60, self.refresh_data)
         GLib.timeout_add_seconds(15, self._ui_heartbeat)
 
@@ -121,6 +150,9 @@ class ClaudeTrackerApp:
         self.latest_version_data = None
         threading.Thread(target=self._check_for_updates, daemon=True).start()
         GLib.timeout_add_seconds(24 * 3600, self._schedule_update_check)
+
+        # Trigger immediate data fetch
+        GLib.idle_add(self.refresh_data)
 
     def _schedule_update_check(self):
         threading.Thread(target=self._check_for_updates, daemon=True).start()
@@ -236,11 +268,11 @@ class ClaudeTrackerApp:
         self.session.present() # Bring to front
 
     def refresh_data(self):
-        # Never let an exception escape: this runs from a GLib timer and a
-        # raised exception would remove the timer, killing refreshes for good
         try:
+            if is_cswap_available():
+                fetch_cswap_accounts_async(self._on_cswap_accounts_fetched)
+
             if not self.session.is_ready:
-                print("DEBUG: Session not ready yet, skipping refresh.")
                 return True
 
             if is_stalled(self.last_fetch_completed, time.time()):
@@ -254,6 +286,195 @@ class ClaudeTrackerApp:
         except Exception as e:
             print(f"DEBUG: refresh_data error: {e}")
         return True
+
+    def _on_cswap_accounts_fetched(self, accounts, error):
+        GLib.idle_add(self._apply_cswap_accounts, accounts, error)
+
+    def _apply_cswap_accounts(self, accounts, error):
+        if error or not accounts:
+            if error:
+                print(f"DEBUG: cswap fetch error: {error}")
+            return False
+
+        self.cswap_accounts = accounts
+        self.last_fetch_completed = time.time()
+
+        # Determine target account
+        target_account = None
+        if self.follow_cli_active:
+            target_account = next((a for a in accounts if a.get("active")), None)
+            if target_account:
+                self.pinned_account = target_account.get("number")
+
+        if not target_account and self.pinned_account is not None:
+            target_account = next(
+                (a for a in accounts if str(a.get("number")) == str(self.pinned_account)),
+                None,
+            )
+
+        if not target_account and accounts:
+            target_account = accounts[0]
+            self.pinned_account = target_account.get("number")
+
+        self._rebuild_accounts_menu()
+        self.item_accounts.show()
+
+        if target_account:
+            self._display_cswap_account(target_account)
+
+        # In cswap mode, hide WebKit plan menu and login button
+        self.item_select_plan.hide()
+        self.item_login.hide()
+        return False
+
+    def _rebuild_accounts_menu(self):
+        for child in self.accounts_menu.get_children():
+            self.accounts_menu.remove(child)
+
+        def sort_key(a):
+            num = a.get("number", 0)
+            num_val = int(num) if str(num).isdigit() else 9999
+            is_ok = 0 if (a.get("active") or a.get("usageStatus") == "ok") else 1
+            return (is_ok, num_val)
+
+        sorted_accs = sorted(self.cswap_accounts, key=sort_key)
+        for acc in sorted_accs:
+            num = acc.get("number")
+            is_pinned = str(num) == str(self.pinned_account)
+            lbl = format_account_label(acc, is_pinned=is_pinned)
+            item = Gtk.MenuItem(label=lbl)
+            item.connect("activate", self._make_account_selector(num))
+            self.accounts_menu.append(item)
+
+        self.accounts_menu.append(Gtk.SeparatorMenuItem())
+
+        item_follow = Gtk.CheckMenuItem(label="Follow CLI Active Account")
+        item_follow.set_active(self.follow_cli_active)
+        item_follow.connect("toggled", self._on_follow_cli_toggled)
+        self.accounts_menu.append(item_follow)
+
+        self.accounts_menu.show_all()
+
+    def _make_account_selector(self, account_num):
+        def on_select(_):
+            self.pinned_account = account_num
+            self.follow_cli_active = False
+            save_config({
+                "pinned_account": self.pinned_account,
+                "follow_cli_active": False,
+            })
+            target = next(
+                (a for a in self.cswap_accounts if str(a.get("number")) == str(account_num)),
+                None,
+            )
+            if target:
+                self._display_cswap_account(target)
+            self._rebuild_accounts_menu()
+        return on_select
+
+    def _on_follow_cli_toggled(self, widget):
+        self.follow_cli_active = widget.get_active()
+        save_config({"follow_cli_active": self.follow_cli_active})
+        if self.follow_cli_active:
+            active_acc = next((a for a in self.cswap_accounts if a.get("active")), None)
+            if active_acc:
+                self.pinned_account = active_acc.get("number")
+                save_config({"pinned_account": self.pinned_account})
+                self._display_cswap_account(active_acc)
+                self._rebuild_accounts_menu()
+
+    def _display_cswap_account(self, account):
+        num = account.get("number")
+        email = account.get("email", "")
+        alias = account.get("alias")
+        tag = alias or f"{num}"
+        active_badge = " [CLI Active]" if account.get("active") else ""
+        name_str = f"{alias} ({email})" if alias else email
+        self.item_account_header.set_label(f"Account: #{num} {name_str}{active_badge}")
+        self.item_account_header.show()
+
+        data = cswap_account_to_tracker_payload(account)
+        self._render_usage(data, account_tag=tag)
+
+    def _render_usage(self, data, account_tag=None):
+        try:
+            # 1. Current Session (5h)
+            five_hour = data.get("five_hour", {})
+            util = five_hour.get("utilization", 0)
+            if util is None:
+                pct = 0
+            else:
+                pct = int(util * 100) if isinstance(util, float) and util <= 1.0 else int(util)
+            reset_str = self._format_time(five_hour.get("resets_at")) or five_hour.get("clock") or "..."
+
+            prefix = f"[{account_tag}] " if account_tag else ""
+            if reset_str != "...":
+                label = f"{prefix}{pct}% ({reset_str})"
+            else:
+                label = f"{prefix}{pct}%"
+
+            self._safe_set_label(label)
+            pace_5h = compute_session_pace(pct, five_hour.get("resets_at"), fetched_at=self.last_fetch_completed)
+            ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
+            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else ""))
+
+            # 2. All Models (Weekly)
+            seven_day = data.get("seven_day", {})
+            if seven_day:
+                u7 = seven_day.get("utilization", 0)
+                p7 = int(u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else int(u7)
+                r7 = self._format_time(seven_day.get("resets_at"), include_day=True) or seven_day.get("clock")
+                pace_7d = compute_weekly_pace(p7, seven_day.get("resets_at"), fetched_at=self.last_fetch_completed)
+                ahead_7d = " (ahead)" if pace_7d and pace_7d.ahead else ""
+                self.item_usage_7d.set_label(f"All models (Weekly): {p7}%{ahead_7d}" + (f" ({r7})" if r7 else ""))
+
+            # 3. Per-model usage
+            model_rows = extract_model_limits(data, fetched_at=self.last_fetch_completed)
+            active_model_keys = [row["key"] for row in model_rows]
+
+            keys_to_remove = []
+            for key, item in self.dynamic_model_items.items():
+                if key not in active_model_keys:
+                    self.menu.remove(item)
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                del self.dynamic_model_items[key]
+
+            children = self.menu.get_children()
+            idx_7d = children.index(self.item_usage_7d)
+
+            for i, row in enumerate(model_rows):
+                key = row["key"]
+                r = self._format_time(row["resets_at"], include_day=True) or row.get("resets_at")
+                pace_row = row.get("pace")
+                ahead_row = " (ahead)" if pace_row and pace_row.ahead else ""
+                label_text = f"{row['name']}: {row['percent']}%{ahead_row}" + (f" ({r})" if r else "")
+
+                if key in self.dynamic_model_items:
+                    self.dynamic_model_items[key].set_label(label_text)
+                    self.dynamic_model_items[key].show()
+                else:
+                    item = Gtk.MenuItem(label=label_text)
+                    item.set_sensitive(False)
+                    insert_idx = idx_7d + 1 + i
+                    self.menu.insert(item, insert_idx)
+                    self.dynamic_model_items[key] = item
+                    item.show()
+
+            # 4. Routine Runs
+            routines = data.get("routine_runs")
+            if routines and isinstance(routines, dict):
+                curr = routines.get("current", 0)
+                lim = routines.get("limit", 15)
+                self.item_routines.set_label(f"Daily routines: {curr}/{lim}")
+                self.item_routines.show()
+            else:
+                self.item_routines.hide()
+
+            self.item_reset.set_label(f"Resets at: {reset_str}")
+            self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}")
+        except Exception as e:
+            print(f"DEBUG: UI update error: {e}")
 
     def _on_orgs_fetched(self, data, error):
         self.last_fetch_completed = time.time()
@@ -313,89 +534,16 @@ class ClaudeTrackerApp:
         self.last_fetch_completed = time.time()
         if error:
             print(f"DEBUG: Usage fetch error: {error}")
-            self._safe_set_label("Auth Error")
+            if not self.cswap_accounts:
+                self._safe_set_label("Auth Error")
             return
         
         if not data:
             data = {}
 
-        try:
-            # 1. Current Session (5h)
-            five_hour = data.get("five_hour", {})
-            util = five_hour.get("utilization", 0)
-            pct = int(util * 100) if isinstance(util, float) and util <= 1.0 else int(util)
-            reset_str = self._format_time(five_hour.get("resets_at")) or "..."
-
-            if reset_str != "...":
-                label = f"{pct}% ({reset_str})"
-            else:
-                label = f"{pct}%"
-
-            self._safe_set_label(label)
-            pace_5h = compute_session_pace(pct, five_hour.get("resets_at"), fetched_at=self.last_fetch_completed)
-            ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
-            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else ""))
-            
-            # 2. All Models (Weekly)
-            seven_day = data.get("seven_day", {})
-            if seven_day:
-                u7 = seven_day.get("utilization", 0)
-                p7 = int(u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else int(u7)
-                r7 = self._format_time(seven_day.get("resets_at"), include_day=True)
-                pace_7d = compute_weekly_pace(p7, seven_day.get("resets_at"), fetched_at=self.last_fetch_completed)
-                ahead_7d = " (ahead)" if pace_7d and pace_7d.ahead else ""
-                self.item_usage_7d.set_label(f"All models (Weekly): {p7}%{ahead_7d}" + (f" ({r7})" if r7 else ""))
-                
-            # 3. Per-model usage (modern `limits` array, legacy seven_day_*
-            # and iguana_necktie keys as fallback)
-            model_rows = extract_model_limits(data, fetched_at=self.last_fetch_completed)
-            active_model_keys = [row["key"] for row in model_rows]
-
-            # Remove any dynamic menu items that are no longer active
-            keys_to_remove = []
-            for key, item in self.dynamic_model_items.items():
-                if key not in active_model_keys:
-                    self.menu.remove(item)
-                    keys_to_remove.append(key)
-            for key in keys_to_remove:
-                del self.dynamic_model_items[key]
-
-            # Update or create menu items for the active rows
-            children = self.menu.get_children()
-            idx_7d = children.index(self.item_usage_7d)
-
-            for i, row in enumerate(model_rows):
-                key = row["key"]
-                r = self._format_time(row["resets_at"], include_day=True)
-                pace_row = row.get("pace")
-                ahead_row = " (ahead)" if pace_row and pace_row.ahead else ""
-                label_text = f"{row['name']}: {row['percent']}%{ahead_row}" + (f" ({r})" if r else "")
-
-                if key in self.dynamic_model_items:
-                    self.dynamic_model_items[key].set_label(label_text)
-                    self.dynamic_model_items[key].show()
-                else:
-                    item = Gtk.MenuItem(label=label_text)
-                    item.set_sensitive(False)
-                    insert_idx = idx_7d + 1 + i
-                    self.menu.insert(item, insert_idx)
-                    self.dynamic_model_items[key] = item
-                    item.show()
-                
-            # 4. Routine Runs (Mapping if available, otherwise hide)
-            routines = data.get("routine_runs")
-            if routines and isinstance(routines, dict):
-                curr = routines.get("current", 0)
-                lim = routines.get("limit", 15)
-                self.item_routines.set_label(f"Daily routines: {curr}/{lim}")
-                self.item_routines.show()
-            else:
-                self.item_routines.hide()
-                
-            self.item_reset.set_label(f"Resets at: {reset_str}")
-            self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}")
-        except Exception as e:
-            print(f"DEBUG: UI update error: {e}")
+        # Only render WebKit usage if cswap is not providing accounts
+        if not self.cswap_accounts:
+            self._render_usage(data, account_tag=None)
 
 def main():
     try:
