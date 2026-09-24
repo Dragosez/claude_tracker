@@ -130,12 +130,11 @@ class ClaudeTrackerApp:
 
         self.indicator.set_menu(self.menu)
 
-        # Initialize Session
-        self.session = get_session(on_success=self.refresh_data)
-        
-        # Automatically start the engine if we likely have auth (only if cswap is not used)
-        cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
+        # Initialize Session lazily (skip WebKit startup if cswap is available)
+        self.session = None
         if not is_cswap_available():
+            self.session = get_session(on_success=self.refresh_data)
+            cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
             if self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0):
                 self.session.ensure_started()
 
@@ -153,8 +152,12 @@ class ClaudeTrackerApp:
         threading.Thread(target=self._check_for_updates, daemon=True).start()
         GLib.timeout_add_seconds(24 * 3600, self._schedule_update_check)
 
-        # Trigger immediate data fetch
-        GLib.idle_add(self.refresh_data)
+        # Trigger immediate data fetch once (must return False to avoid infinite idle loop)
+        def _initial_refresh():
+            self.refresh_data()
+            return False
+
+        GLib.idle_add(_initial_refresh)
 
     def _schedule_update_check(self):
         threading.Thread(target=self._check_for_updates, daemon=True).start()
@@ -265,6 +268,8 @@ class ClaudeTrackerApp:
         return False
 
     def open_login(self):
+        if not self.session:
+            self.session = get_session(on_success=self.refresh_data)
         self.session.ensure_started()
         self.session.show_all()
         self.session.present() # Bring to front
@@ -277,7 +282,7 @@ class ClaudeTrackerApp:
                     fetch_cswap_accounts_async(self._on_cswap_accounts_fetched)
                 return True
 
-            if not self.session.is_ready:
+            if not self.session or not self.session.is_ready:
                 return True
 
             if is_stalled(self.last_fetch_completed, time.time()):
@@ -302,6 +307,8 @@ class ClaudeTrackerApp:
                 print(f"DEBUG: cswap fetch error: {error}")
             return False
 
+        old_accounts = self.cswap_accounts
+        old_pinned = getattr(self, "_last_rendered_pinned", None)
         self.cswap_accounts = accounts
         self.last_fetch_completed = time.time()
 
@@ -322,8 +329,15 @@ class ClaudeTrackerApp:
             target_account = accounts[0]
             self.pinned_account = target_account.get("number")
 
-        self._rebuild_accounts_menu()
-        self.item_accounts.show()
+        needs_rebuild = (
+            old_accounts != accounts or
+            old_pinned != self.pinned_account or
+            len(self.accounts_menu.get_children()) == 0
+        )
+        if needs_rebuild:
+            self._last_rendered_pinned = self.pinned_account
+            self._rebuild_accounts_menu()
+            self.item_accounts.show()
 
         if target_account:
             self._display_cswap_account(target_account)
