@@ -30,6 +30,8 @@ from .cswap import (
     fetch_cswap_accounts_async,
     cswap_account_to_tracker_payload,
     format_account_label,
+    get_account_age_seconds,
+    format_age,
 )
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
@@ -410,13 +412,21 @@ class ClaudeTrackerApp:
         tag = alias or f"{num}"
         active_badge = " [CLI Active]" if account.get("active") else ""
         name_str = f"{alias} ({email})" if alias else email
-        self.item_account_header.set_label(f"Account: #{num} {name_str}{active_badge}")
+        status_str = account.get("usageStatus", "ok")
+        if status_str == "relogin_required":
+            status_badge = " [Re-login needed]"
+        elif status_str != "ok":
+            status_badge = f" [{status_str.replace('_', ' ').title()}]"
+        else:
+            status_badge = ""
+        self.item_account_header.set_label(f"Account: #{num} {name_str}{status_badge}{active_badge}")
         self.item_account_header.show()
 
         data = cswap_account_to_tracker_payload(account)
-        self._render_usage(data, account_tag=tag)
+        age_str = format_age(get_account_age_seconds(account))
+        self._render_usage(data, account_tag=tag, age_str=age_str, status_str=status_str)
 
-    def _render_usage(self, data, account_tag=None):
+    def _render_usage(self, data, account_tag=None, age_str=None, status_str="ok"):
         try:
             # 1. Current Session (5h)
             five_hour = data.get("five_hour", {})
@@ -428,7 +438,11 @@ class ClaudeTrackerApp:
             reset_str = self._format_time(five_hour.get("resets_at")) or five_hour.get("clock") or "..."
 
             prefix = f"[{account_tag}] " if account_tag else ""
-            if reset_str != "...":
+            if status_str == "relogin_required" and not data.get("five_hour", {}).get("resets_at"):
+                label = f"{prefix}Re-login needed"
+            elif age_str and status_str == "relogin_required":
+                label = f"{prefix}{pct}% ({age_str})"
+            elif reset_str != "...":
                 label = f"{prefix}{pct}% ({reset_str})"
             else:
                 label = f"{prefix}{pct}%"
@@ -436,7 +450,8 @@ class ClaudeTrackerApp:
             self._safe_set_label(label)
             pace_5h = compute_session_pace(pct, five_hour.get("resets_at"), fetched_at=self.last_fetch_completed)
             ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
-            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else ""))
+            st_note = " [Re-login needed]" if status_str == "relogin_required" else ""
+            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else "") + st_note)
 
             # 2. All Models (Weekly)
             seven_day = data.get("seven_day", {})
@@ -492,7 +507,10 @@ class ClaudeTrackerApp:
                 self.item_routines.hide()
 
             self.item_reset.set_label(f"Resets at: {reset_str}")
-            self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}")
+            if age_str:
+                self.item_time.set_label(f"Last Updated: {age_str}")
+            else:
+                self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}")
         except Exception as e:
             print(f"DEBUG: UI update error: {e}")
 

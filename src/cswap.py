@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import shutil
 import subprocess
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 CSWAP_DIR = os.path.expanduser("~/.local/share/claude-swap")
@@ -70,6 +72,7 @@ def fetch_cswap_accounts_sync() -> Tuple[Optional[List[Dict[str, Any]]], Optiona
                         "usageStatus": "ok" if item.get("lastGood") else (item.get("lastError") or "unknown"),
                         "usage": item.get("lastGood"),
                         "lastGoodUsage": item.get("lastGood"),
+                        "fetchedAt": item.get("fetchedAt"),
                     })
                 return accounts, None
         except Exception as e:
@@ -158,6 +161,52 @@ def cswap_account_to_tracker_payload(account: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def get_account_age_seconds(account: Dict[str, Any]) -> Optional[float]:
+    """Return the age in seconds of the account's usage measurement."""
+    # 1. Direct age seconds from cswap list --json
+    if account.get("usage") is not None and account.get("usageAgeSeconds") is not None:
+        try:
+            return float(account["usageAgeSeconds"])
+        except (ValueError, TypeError):
+            pass
+
+    if account.get("lastGoodAgeSeconds") is not None:
+        try:
+            return float(account["lastGoodAgeSeconds"])
+        except (ValueError, TypeError):
+            pass
+
+    # 2. ISO timestamp strings (usageFetchedAt or lastGoodFetchedAt)
+    ts_str = account.get("usageFetchedAt") or account.get("lastGoodFetchedAt")
+    if ts_str and isinstance(ts_str, str):
+        try:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+        except Exception:
+            pass
+
+    # 3. Numeric epoch timestamp from file cache (fetchedAt or lastGoodFetchedAt)
+    epoch = account.get("fetchedAt") or account.get("lastGoodFetchedAt")
+    if isinstance(epoch, (int, float)):
+        return max(0.0, time.time() - epoch)
+
+    return None
+
+
+def format_age(seconds: Optional[float]) -> Optional[str]:
+    """Format seconds into a compact human-readable string: just now, 5m ago, 16h ago, 8d ago."""
+    if seconds is None or seconds < 0:
+        return None
+    s = int(seconds)
+    if s < 60:
+        return "just now"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
 def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> str:
     """Format an account entry for display in the Accounts submenu."""
     num = account.get("number", "?")
@@ -171,7 +220,11 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
     pin_mark = "●" if is_pinned else "○"
     active_tag = " [CLI Active]" if is_active else ""
 
+    age_s = get_account_age_seconds(account)
+    age_str = format_age(age_s)
+
     usage = account.get("usage") or account.get("lastGoodUsage")
+    stats = None
     if usage:
         five_h = usage.get("fiveHour") or usage.get("five_hour") or {}
         seven_d = usage.get("sevenDay") or usage.get("seven_day") or {}
@@ -181,13 +234,31 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
             stats = f"{p5:.0f}% / {p7:.0f}%"
         elif p5 is not None:
             stats = f"{p5:.0f}%"
-        else:
-            stats = "no usage"
-    elif status_str == "relogin_required":
-        stats = "Re-login needed"
-    elif status_str != "ok":
-        stats = status_str.replace("_", " ")
-    else:
-        stats = "no usage"
 
-    return f"{pin_mark} #{num}: {name_part} ({stats}){active_tag}"
+    if status_str == "relogin_required":
+        prefix = "Re-login needed"
+        parts = [prefix]
+        if stats:
+            parts.append(stats)
+        if age_str:
+            parts.append(age_str)
+        details = " · ".join(parts)
+    elif status_str != "ok":
+        prefix = status_str.replace("_", " ").title()
+        parts = [prefix]
+        if stats:
+            parts.append(stats)
+        if age_str:
+            parts.append(age_str)
+        details = " · ".join(parts)
+    else:
+        if stats and age_str:
+            details = f"{stats} · {age_str}"
+        elif stats:
+            details = stats
+        elif age_str:
+            details = f"no usage · {age_str}"
+        else:
+            details = "no usage"
+
+    return f"{pin_mark} #{num}: {name_part} ({details}){active_tag}"
