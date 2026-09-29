@@ -19,8 +19,7 @@ if os.geteuid() == 0:
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('AyatanaAppIndicator3', '0.1')
-from gi.repository import Gtk, AyatanaAppIndicator3 as AppIndicator, GLib, Gio
+from gi.repository import Gtk, GLib, Gio
 
 from .auth import get_session
 from .cleanup import remove_legacy_user_install
@@ -31,6 +30,7 @@ from .cswap import (
     cswap_account_to_tracker_payload,
     format_account_label,
 )
+from .tray import create_tray
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
 from .watchdog import is_stalled
@@ -54,12 +54,7 @@ class ClaudeTrackerApp:
         self.follow_cli_active = cfg.get("follow_cli_active", True)
         self.cswap_accounts = []
         
-        self.indicator = AppIndicator.Indicator.new(
-            APP_ID,
-            ICON_PATH,
-            AppIndicator.IndicatorCategory.APPLICATION_STATUS
-        )
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator = create_tray(APP_ID, ICON_PATH)
         self._safe_set_label(self.current_label)
         
         # Build menu
@@ -262,7 +257,7 @@ class ClaudeTrackerApp:
 
     def _do_set_label(self, label):
         try:
-            self.indicator.set_label(label, " " * 30)
+            self.indicator.set_label(label)
         except Exception as e:
             print(f"DEBUG: Indicator set_label error: {e}")
         return False
