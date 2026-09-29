@@ -7,6 +7,8 @@ APPS_DIR = $(HOME)/.local/share/applications
 install:
 	@echo "Installing system dependencies..."
 	@sudo apt-get install -y python3-gi gir1.2-ayatanaappindicator3-0.1 gir1.2-webkit2-4.1 python3-requests || (echo "Apt failed, trying to continue..." && true)
+	@echo "Installing optional XApp bindings (needed for the panel label on Linux Mint/Cinnamon)..."
+	@sudo apt-get install -y gir1.2-xapp-1.0 || (echo "gir1.2-xapp-1.0 not available, skipping (only needed on Cinnamon)." && true)
 	@echo "Creating directories..."
 	@mkdir -p $(INSTALL_DIR)
 	@mkdir -p $(BIN_DIR)
@@ -15,7 +17,9 @@ install:
 	@echo "Copying files..."
 	@cp -r src run.py $(INSTALL_DIR)/
 	@echo "Creating executable..."
-	@echo '#!/bin/bash\npython3 $(INSTALL_DIR)/run.py "$$@"' > $(BIN_DIR)/claude-tracker
+	@# Use the system interpreter: PyGObject/GTK bindings are apt packages and are
+	@# missing from pyenv/conda/venv pythons that may shadow `python3` on PATH.
+	@echo '#!/bin/bash\n/usr/bin/python3 $(INSTALL_DIR)/run.py "$$@"' > $(BIN_DIR)/claude-tracker
 	@chmod +x $(BIN_DIR)/claude-tracker
 	@echo "Creating desktop entries..."
 	@echo "[Desktop Entry]\nType=Application\nExec=$(BIN_DIR)/claude-tracker\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nName=Claude Tracker\nComment=Track Claude Usage\nIcon=$(INSTALL_DIR)/src/assets/claude-tracker-icon.png" > $(AUTOSTART_DIR)/claude-tracker.desktop
