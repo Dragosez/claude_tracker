@@ -181,6 +181,65 @@ class TestStandaloneAccounts(unittest.TestCase):
         # Removing non-existent account returns False
         self.assertFalse(standalone.remove_standalone_account_sync("999"))
 
+    @patch("src.standalone.fetch_oauth_usage_sync")
+    @patch("src.standalone.fetch_oauth_profile_sync")
+    def test_fetch_standalone_rate_limited_backoff(self, mock_profile, mock_usage):
+        future_ms = int(time.time() * 1000) + 3600 * 1000
+        creds = {"claudeAiOauth": {"accessToken": "tok_rl", "expiresAt": future_ms}}
+        standalone.save_cli_credentials(creds)
+        standalone.set_rate_limited(300.0)
+
+        self.assertTrue(standalone.is_rate_limited())
+        self.assertGreater(standalone.get_rate_limit_reset_remaining(), 0)
+
+        # Call fetch without force -> should not call mock_usage or mock_profile
+        accs, err = standalone.fetch_standalone_accounts_sync(force=False)
+        self.assertIn("Rate limited", err)
+        mock_profile.assert_not_called()
+        mock_usage.assert_not_called()
+
+        # Reset rate limit state for other tests
+        standalone._rate_limited_until = 0.0
+
+    @patch("src.standalone.fetch_oauth_usage_sync")
+    @patch("src.standalone.fetch_oauth_profile_sync")
+    def test_fetch_standalone_429_preserves_last_good_usage(self, mock_profile, mock_usage):
+        standalone._rate_limited_until = 0.0
+        future_ms = int(time.time() * 1000) + 3600 * 1000
+        creds = {"claudeAiOauth": {"accessToken": "tok_429", "expiresAt": future_ms}}
+        standalone.save_cli_credentials(creds)
+
+        # Pre-populate account with last good usage
+        prev_usage = {"five_hour": {"utilization": 0.88, "resets_at": "2026-10-02T18:00:00Z"}}
+        standalone.save_standalone_accounts([
+            {
+                "id": "org1",
+                "email": "user@test.com",
+                "organizationUuid": "org1",
+                "name": "Cached User",
+                "active": True,
+                "usage": prev_usage,
+                "lastGoodUsage": prev_usage,
+                "fetchedAt": 1000.0,
+                "usageFetchedAt": "2026-10-02T10:00:00Z",
+            }
+        ])
+
+        # Return 429 for usage
+        mock_usage.return_value = (None, "http_429")
+
+        accs, err = standalone.fetch_standalone_accounts_sync()
+        self.assertIsNone(err)
+        self.assertEqual(len(accs), 1)
+        self.assertEqual(accs[0]["usageStatus"], "rate_limited")
+        # Should keep previous good usage
+        self.assertEqual(accs[0]["usage"], prev_usage)
+        self.assertEqual(accs[0]["lastGoodUsage"], prev_usage)
+        self.assertEqual(accs[0]["fetchedAt"], 1000.0)
+
+        # Clean up rate limit state
+        standalone._rate_limited_until = 0.0
+
 
 if __name__ == "__main__":
     unittest.main()

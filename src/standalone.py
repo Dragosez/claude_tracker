@@ -141,6 +141,40 @@ def ensure_valid_token_sync(
     return oauth["accessToken"], True, None
 
 
+_rate_limited_until: float = 0.0
+
+
+def is_rate_limited() -> bool:
+    """Return True if Anthropic API rate limit backoff is currently active."""
+    return time.time() < _rate_limited_until
+
+
+def get_rate_limit_reset_remaining() -> int:
+    """Return remaining seconds until rate limit backoff expires."""
+    return max(0, int(_rate_limited_until - time.time()))
+
+
+def set_rate_limited(backoff_seconds: float = 300.0) -> None:
+    """Activate rate limit backoff for the specified number of seconds."""
+    global _rate_limited_until
+    _rate_limited_until = max(_rate_limited_until, time.time() + backoff_seconds)
+
+
+def _handle_http_error(e: urllib.error.HTTPError) -> str:
+    """Extract error and trigger rate limit backoff on 429."""
+    if e.code == 429:
+        retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+        backoff = 300.0
+        if retry_after:
+            try:
+                backoff = max(float(retry_after), 60.0)
+            except (ValueError, TypeError):
+                pass
+        set_rate_limited(backoff)
+        return "http_429"
+    return f"HTTP {e.code}"
+
+
 def fetch_oauth_profile_sync(
     access_token: str, timeout_s: float = 10.0
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -158,7 +192,7 @@ def fetch_oauth_profile_sync(
             data = json.loads(resp.read().decode("utf-8"))
             return data, None
     except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}"
+        return None, _handle_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -180,7 +214,7 @@ def fetch_oauth_usage_sync(
             data = json.loads(resp.read().decode("utf-8"))
             return data, None
     except urllib.error.HTTPError as e:
-        return None, f"HTTP {e.code}"
+        return None, _handle_http_error(e)
     except Exception as e:
         return None, str(e)
 
@@ -238,7 +272,7 @@ def remove_standalone_account_sync(target_id_or_email: str) -> bool:
     return False
 
 
-def fetch_standalone_accounts_sync() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def fetch_standalone_accounts_sync(force: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """Synchronously fetch active CLI account data and return updated accounts list."""
     accounts = load_standalone_accounts()
     cli_creds = get_cli_credentials()
@@ -249,28 +283,45 @@ def fetch_standalone_accounts_sync() -> Tuple[List[Dict[str, Any]], Optional[str
             a["active"] = False
         return accounts, "No active Claude CLI credentials found"
 
+    if is_rate_limited() and not force:
+        rem = get_rate_limit_reset_remaining()
+        print(f"DEBUG: Anthropic API rate limited, backoff active for {rem}s")
+        for a in accounts:
+            if a.get("active") and a.get("fetchedAt"):
+                a["usageAgeSeconds"] = max(0.0, time.time() - a["fetchedAt"])
+        return accounts, f"Rate limited by Anthropic API ({rem}s remaining)"
+
     token, was_refreshed, err = ensure_valid_token_sync(cli_creds, save_if_refreshed=True)
     if not token:
         for a in accounts:
             a["active"] = False
         return accounts, f"Authentication required: {err}"
 
-    profile, prof_err = fetch_oauth_profile_sync(token)
+    # Check if existing active account already has profile cached to avoid redundant network calls
+    existing_active = next((a for a in accounts if a.get("active")), None)
+    profile = None
+    prof_err = None
+    if not force and existing_active and existing_active.get("email") and existing_active.get("organizationUuid"):
+        email = existing_active.get("email", "")
+        full_name = existing_active.get("name")
+        org_uuid = existing_active.get("organizationUuid")
+        org_name = existing_active.get("organizationName")
+        sub_type = existing_active.get("subscriptionType")
+    else:
+        profile, prof_err = fetch_oauth_profile_sync(token)
+        account_meta = profile.get("account", {}) if profile else {}
+        org_meta = profile.get("organization", {}) if profile else {}
+
+        email = account_meta.get("email") or ""
+        full_name = account_meta.get("full_name") or account_meta.get("display_name")
+        org_uuid = org_meta.get("uuid") or account_meta.get("uuid")
+        org_name = org_meta.get("name")
+        sub_type = org_meta.get("organization_type") or org_meta.get("rate_limit_tier")
+
     usage, usage_err = fetch_oauth_usage_sync(token)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     now_epoch = time.time()
-
-    account_meta = profile.get("account", {}) if profile else {}
-    org_meta = profile.get("organization", {}) if profile else {}
-
-    email = account_meta.get("email") or ""
-    full_name = account_meta.get("full_name") or account_meta.get("display_name")
-    org_uuid = org_meta.get("uuid") or account_meta.get("uuid")
-    org_name = org_meta.get("name")
-    sub_type = org_meta.get("organization_type") or org_meta.get("rate_limit_tier")
-
-    status = "ok" if usage else (usage_err or prof_err or "unknown")
 
     # Match active account in existing accounts list
     found_idx = -1
@@ -279,36 +330,48 @@ def fetch_standalone_accounts_sync() -> Tuple[List[Dict[str, Any]], Optional[str
             found_idx = i
             break
 
+    existing = accounts[found_idx] if found_idx >= 0 else {}
+
+    # If usage fetch failed (e.g. rate limited), preserve previous good usage and timestamps
+    effective_usage = usage or existing.get("lastGoodUsage") or existing.get("usage")
+    if usage:
+        status = "ok"
+        fetched_at = now_epoch
+        usage_fetched_at = now_iso
+        age_seconds = 0.0
+    else:
+        if usage_err == "http_429" or is_rate_limited():
+            status = "rate_limited" if effective_usage else "http_429"
+        else:
+            status = "ok" if effective_usage else (usage_err or prof_err or "unknown")
+        fetched_at = existing.get("fetchedAt") or now_epoch
+        usage_fetched_at = existing.get("usageFetchedAt") or now_iso
+        age_seconds = max(0.0, time.time() - fetched_at)
+
     active_acc: Dict[str, Any] = {
         "id": org_uuid or email or "cli-active",
-        "email": email,
-        "name": full_name or (email.split("@")[0] if email else "CLI Account"),
-        "alias": full_name or (email.split("@")[0] if email else "CLI Account"),
-        "organizationUuid": org_uuid,
-        "organizationName": org_name,
-        "subscriptionType": sub_type,
+        "email": email or existing.get("email", ""),
+        "name": full_name or existing.get("name") or (email.split("@")[0] if email else "CLI Account"),
+        "alias": existing.get("alias") or full_name or existing.get("name") or (email.split("@")[0] if email else "CLI Account"),
+        "organizationUuid": org_uuid or existing.get("organizationUuid"),
+        "organizationName": org_name or existing.get("organizationName"),
+        "subscriptionType": sub_type or existing.get("subscriptionType"),
         "active": True,
         "usageStatus": status,
-        "usage": usage,
-        "lastGoodUsage": usage if usage else None,
-        "usageFetchedAt": now_iso,
-        "fetchedAt": now_epoch,
-        "usageAgeSeconds": 0.0,
+        "usage": effective_usage,
+        "lastGoodUsage": effective_usage,
+        "usageFetchedAt": usage_fetched_at,
+        "fetchedAt": fetched_at,
+        "usageAgeSeconds": age_seconds,
         "credentials": cli_creds,
     }
 
+    if existing.get("number") is not None:
+        active_acc["number"] = existing["number"]
+
     if found_idx >= 0:
-        # Preserve user-customized alias or number if present
-        existing = accounts[found_idx]
-        if existing.get("alias"):
-            active_acc["alias"] = existing["alias"]
-        if existing.get("number") is not None:
-            active_acc["number"] = existing["number"]
-        if not active_acc.get("usage") and existing.get("lastGoodUsage"):
-            active_acc["lastGoodUsage"] = existing["lastGoodUsage"]
         accounts[found_idx] = active_acc
     else:
-        # New account discovered
         accounts.insert(0, active_acc)
 
     # Mark all other accounts inactive
@@ -321,11 +384,12 @@ def fetch_standalone_accounts_sync() -> Tuple[List[Dict[str, Any]], Optional[str
 
 
 def fetch_standalone_accounts_async(
-    callback: Callable[[List[Dict[str, Any]], Optional[str]], None]
+    callback: Callable[[List[Dict[str, Any]], Optional[str]], None],
+    force: bool = False,
 ) -> None:
     """Fetch standalone accounts asynchronously in a background thread."""
     def worker():
-        accs, err = fetch_standalone_accounts_sync()
+        accs, err = fetch_standalone_accounts_sync(force=force)
         callback(accs, err)
 
     threading.Thread(target=worker, daemon=True).start()

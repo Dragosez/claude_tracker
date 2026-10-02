@@ -43,6 +43,7 @@ from .standalone import (
     import_cswap_accounts_async,
     load_standalone_accounts,
     clear_inactive_standalone_accounts,
+    get_cli_credentials,
 )
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
@@ -50,9 +51,10 @@ from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
+REFRESH_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 
 class ClaudeTrackerApp:
     def __init__(self):
@@ -131,7 +133,7 @@ class ClaudeTrackerApp:
         self.menu.append(self.item_select_plan)
         
         item_refresh = Gtk.MenuItem(label="Refresh Data")
-        item_refresh.connect("activate", lambda _: self.refresh_data())
+        item_refresh.connect("activate", lambda _: self.refresh_data(force=True))
         self.menu.append(item_refresh)
         
         self.item_login = Gtk.MenuItem(label="Login / Change Account")
@@ -169,8 +171,8 @@ class ClaudeTrackerApp:
         self._creds_refresh_timeout = None
         self._setup_creds_monitor()
 
-        # Periodic updates: poll every 60s
-        GLib.timeout_add_seconds(60, self.refresh_data)
+        # Periodic updates: poll every 15 minutes (900s)
+        GLib.timeout_add_seconds(REFRESH_INTERVAL_SECONDS, self.refresh_data)
         GLib.timeout_add_seconds(15, self._ui_heartbeat)
 
         # Check for updates in background: once at startup, then every 24h
@@ -307,8 +309,21 @@ class ClaudeTrackerApp:
             creds_file = Gio.File.new_for_path(CREDENTIALS_PATH)
             self._creds_monitor = creds_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
             self._creds_monitor.connect("changed", self._on_creds_file_changed)
+            self._last_creds_fingerprint = self._get_creds_fingerprint()
         except Exception as e:
             print(f"DEBUG: Could not set up credentials file monitor: {e}")
+
+    def _get_creds_fingerprint(self):
+        creds = get_cli_credentials()
+        if not creds:
+            return None
+        oauth = creds.get("claudeAiOauth", {})
+        return (
+            oauth.get("accessToken"),
+            oauth.get("refreshToken"),
+            oauth.get("subscriptionType"),
+            oauth.get("rateLimitTier"),
+        )
 
     def _on_creds_file_changed(self, monitor, file, other_file, event_type):
         if event_type in (
@@ -317,16 +332,20 @@ class ClaudeTrackerApp:
             Gio.FileMonitorEvent.CHANGES_DONE_HINT,
         ):
             if self.account_source == "standalone" or self.follow_cli_active:
+                current_fp = self._get_creds_fingerprint()
+                if current_fp == getattr(self, "_last_creds_fingerprint", None):
+                    return
+                self._last_creds_fingerprint = current_fp
                 if getattr(self, "_creds_refresh_timeout", None):
                     GLib.source_remove(self._creds_refresh_timeout)
-                self._creds_refresh_timeout = GLib.timeout_add(300, self._do_creds_triggered_refresh)
+                self._creds_refresh_timeout = GLib.timeout_add_seconds(2, self._do_creds_triggered_refresh)
 
     def _do_creds_triggered_refresh(self):
         self._creds_refresh_timeout = None
-        self.refresh_data()
+        self.refresh_data(force=True)
         return False
 
-    def refresh_data(self):
+    def refresh_data(self, force: bool = False):
         try:
             if self.account_source == "cswap" and is_cswap_available():
                 if not self.is_fetching_cswap:
@@ -337,7 +356,7 @@ class ClaudeTrackerApp:
             # Standalone mode: fetch via direct CLI credentials
             if not self.is_fetching_standalone:
                 self.is_fetching_standalone = True
-                fetch_standalone_accounts_async(self._on_standalone_accounts_fetched)
+                fetch_standalone_accounts_async(self._on_standalone_accounts_fetched, force=force)
             return True
         except Exception as e:
             print(f"DEBUG: refresh_data error: {e}")
@@ -669,6 +688,8 @@ class ClaudeTrackerApp:
         status_str = account.get("usageStatus", "ok")
         if status_str == "relogin_required":
             status_badge = " [Re-login needed]"
+        elif status_str in ("rate_limited", "http_429"):
+            status_badge = " [Rate Limited]" if not account.get("usage") else ""
         elif status_str != "ok":
             status_badge = f" [{status_str.replace('_', ' ').title()}]"
         else:
@@ -761,10 +782,12 @@ class ClaudeTrackerApp:
                 self.item_routines.hide()
 
             self.item_reset.set_label(f"Resets at: {reset_str}")
+            is_rl = status_str in ("rate_limited", "http_429")
+            rl_suffix = " (rate limited)" if is_rl else ""
             if age_str:
-                self.item_time.set_label(f"Last Updated: {age_str}")
+                self.item_time.set_label(f"Last Updated: {age_str}{rl_suffix}")
             else:
-                self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}")
+                self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}{rl_suffix}")
         except Exception as e:
             print(f"DEBUG: UI update error: {e}")
 
