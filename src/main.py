@@ -27,11 +27,21 @@ from .cleanup import remove_legacy_user_install
 from .config import clear_config, save_config, load_config
 from .cswap import (
     is_cswap_available,
+    is_cswap_installed,
+    is_cswap_data_available,
     fetch_cswap_accounts_async,
+    switch_cswap_account_async,
     cswap_account_to_tracker_payload,
     format_account_label,
     get_account_age_seconds,
     format_age,
+)
+from .standalone import (
+    CREDENTIALS_PATH,
+    fetch_standalone_accounts_async,
+    switch_standalone_account_async,
+    import_cswap_accounts_async,
+    load_standalone_accounts,
 )
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
@@ -39,7 +49,7 @@ from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
@@ -47,6 +57,7 @@ class ClaudeTrackerApp:
     def __init__(self):
         self.is_fetching = False
         self.is_fetching_cswap = False
+        self.is_fetching_standalone = False
         self.last_fetch_completed = time.time()
         self.current_label = "Login Required"
         
@@ -54,7 +65,18 @@ class ClaudeTrackerApp:
         self.org_id = cfg.get("organization_uuid")
         self.pinned_account = cfg.get("pinned_account")
         self.follow_cli_active = cfg.get("follow_cli_active", True)
+        
+        configured_source = cfg.get("account_source")
+        if configured_source in ("standalone", "cswap"):
+            self.account_source = configured_source
+        else:
+            if is_cswap_installed() and not os.path.exists(CREDENTIALS_PATH):
+                self.account_source = "cswap"
+            else:
+                self.account_source = "standalone"
+
         self.cswap_accounts = []
+        self.standalone_accounts = []
         
         self.indicator = AppIndicator.Indicator.new(
             APP_ID,
@@ -132,19 +154,22 @@ class ClaudeTrackerApp:
 
         self.indicator.set_menu(self.menu)
 
-        # Initialize Session lazily (skip WebKit startup if cswap is available)
+        # Initialize Session lazily (skip WebKit startup if CLI credentials exist)
         self.session = None
-        if not is_cswap_available():
+        cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
+        has_cookies = os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0
+        if not os.path.exists(CREDENTIALS_PATH) and not is_cswap_available():
             self.session = get_session(on_success=self.refresh_data)
-            cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
-            if self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0):
+            if self.org_id or has_cookies:
                 self.session.ensure_started()
 
-        # Periodic updates: cswap accounts poll every 60s, WebKit every 10m
-        if is_cswap_available():
-            GLib.timeout_add_seconds(60, self.refresh_data)
-        else:
-            GLib.timeout_add_seconds(10 * 60, self.refresh_data)
+        # Monitor ~/.claude/.credentials.json for instant account switch detection
+        self._creds_monitor = None
+        self._creds_refresh_timeout = None
+        self._setup_creds_monitor()
+
+        # Periodic updates: poll every 60s
+        GLib.timeout_add_seconds(60, self.refresh_data)
         GLib.timeout_add_seconds(15, self._ui_heartbeat)
 
         # Check for updates in background: once at startup, then every 24h
@@ -276,25 +301,43 @@ class ClaudeTrackerApp:
         self.session.show_all()
         self.session.present() # Bring to front
 
+    def _setup_creds_monitor(self):
+        try:
+            creds_file = Gio.File.new_for_path(CREDENTIALS_PATH)
+            self._creds_monitor = creds_file.monitor_file(Gio.FileMonitorFlags.NONE, None)
+            self._creds_monitor.connect("changed", self._on_creds_file_changed)
+        except Exception as e:
+            print(f"DEBUG: Could not set up credentials file monitor: {e}")
+
+    def _on_creds_file_changed(self, monitor, file, other_file, event_type):
+        if event_type in (
+            Gio.FileMonitorEvent.CHANGED,
+            Gio.FileMonitorEvent.CREATED,
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+        ):
+            if self.account_source == "standalone" or self.follow_cli_active:
+                if getattr(self, "_creds_refresh_timeout", None):
+                    GLib.source_remove(self._creds_refresh_timeout)
+                self._creds_refresh_timeout = GLib.timeout_add(300, self._do_creds_triggered_refresh)
+
+    def _do_creds_triggered_refresh(self):
+        self._creds_refresh_timeout = None
+        self.refresh_data()
+        return False
+
     def refresh_data(self):
         try:
-            if is_cswap_available():
+            if self.account_source == "cswap" and is_cswap_available():
                 if not self.is_fetching_cswap:
                     self.is_fetching_cswap = True
                     fetch_cswap_accounts_async(self._on_cswap_accounts_fetched)
                 return True
 
-            if not self.session or not self.session.is_ready:
-                return True
-
-            if is_stalled(self.last_fetch_completed, time.time()):
-                print("DEBUG: No fetch completed recently; recovering WebKit session...")
-                self.last_fetch_completed = time.time()
-                self.session.recover()
-                return True
-
-            print("DEBUG: Refreshing data via WebKit...")
-            self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
+            # Standalone mode: fetch via direct CLI credentials
+            if not self.is_fetching_standalone:
+                self.is_fetching_standalone = True
+                fetch_standalone_accounts_async(self._on_standalone_accounts_fetched)
+            return True
         except Exception as e:
             print(f"DEBUG: refresh_data error: {e}")
         return True
@@ -342,31 +385,159 @@ class ClaudeTrackerApp:
             self.item_accounts.show()
 
         if target_account:
-            self._display_cswap_account(target_account)
+            self._display_account(target_account)
 
         # In cswap mode, hide WebKit plan menu and login button
         self.item_select_plan.hide()
         self.item_login.hide()
         return False
 
+    def _on_standalone_accounts_fetched(self, accounts, error):
+        GLib.idle_add(self._apply_standalone_accounts, accounts, error)
+
+    def _apply_standalone_accounts(self, accounts, error):
+        self.is_fetching_standalone = False
+        if error:
+            print(f"DEBUG: Standalone fetch error: {error}")
+
+        old_accounts = self.standalone_accounts
+        old_pinned = getattr(self, "_last_rendered_pinned", None)
+        self.standalone_accounts = accounts or []
+        self.last_fetch_completed = time.time()
+
+        target_account = None
+        if self.follow_cli_active:
+            target_account = next((a for a in self.standalone_accounts if a.get("active")), None)
+            if target_account:
+                self.pinned_account = target_account.get("id") or target_account.get("email")
+
+        if not target_account and self.pinned_account is not None:
+            target_account = next(
+                (
+                    a for a in self.standalone_accounts
+                    if str(a.get("id")) == str(self.pinned_account)
+                    or str(a.get("email")) == str(self.pinned_account)
+                    or (a.get("number") is not None and str(a.get("number")) == str(self.pinned_account))
+                ),
+                None,
+            )
+
+        if not target_account and self.standalone_accounts:
+            target_account = self.standalone_accounts[0]
+            self.pinned_account = target_account.get("id") or target_account.get("email")
+
+        needs_rebuild = (
+            old_accounts != self.standalone_accounts or
+            old_pinned != self.pinned_account or
+            len(self.accounts_menu.get_children()) == 0
+        )
+        if needs_rebuild:
+            self._last_rendered_pinned = self.pinned_account
+            self._rebuild_accounts_menu()
+            self.item_accounts.show()
+
+        if target_account:
+            self._display_account(target_account)
+            self.item_select_plan.hide()
+        elif not self.standalone_accounts:
+            self._fallback_to_webkit()
+
+        return False
+
+    def _fallback_to_webkit(self):
+        if not self.session:
+            self.session = get_session(on_success=self.refresh_data)
+        cookies_path = os.path.expanduser("~/.config/claude-tracker/cookies.txt")
+        if not self.session.started and (self.org_id or (os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0)):
+            self.session.ensure_started()
+
+        if self.session and self.session.is_ready:
+            self.session.fetch_json("https://claude.ai/api/organizations", self._on_orgs_fetched)
+            self.item_select_plan.show()
+            self.item_login.show()
+        else:
+            self._safe_set_label("Login Required")
+            self.item_account_header.set_label("Account: Not logged in")
+            self.item_account_header.show()
+            self.item_login.show()
+
+    def _set_account_source(self, source):
+        if self.account_source == source:
+            return
+        self.account_source = source
+        save_config({"account_source": source})
+        self.pinned_account = None
+        self._last_rendered_pinned = None
+        self.refresh_data()
+
+    def _on_import_cswap_clicked(self, _):
+        import_cswap_accounts_async(self._on_import_cswap_completed)
+
+    def _on_import_cswap_completed(self, count, err):
+        def _show():
+            if err:
+                msg = f"Failed to import from cswap: {err}"
+            elif count == 0:
+                msg = "No new accounts to import from cswap."
+            else:
+                msg = f"Successfully imported {count} accounts from cswap!"
+            dialog = Gtk.MessageDialog(
+                transient_for=None,
+                flags=0,
+                message_type=Gtk.MessageType.INFO if not err else Gtk.MessageType.WARNING,
+                buttons=Gtk.ButtonsType.OK,
+                text=msg,
+            )
+            dialog.run()
+            dialog.destroy()
+            self.refresh_data()
+            return False
+        GLib.idle_add(_show)
+
     def _rebuild_accounts_menu(self):
         for child in self.accounts_menu.get_children():
             self.accounts_menu.remove(child)
 
-        def sort_key(a):
-            num = a.get("number", 0)
-            num_val = int(num) if str(num).isdigit() else 9999
-            is_ok = 0 if (a.get("active") or a.get("usageStatus") == "ok") else 1
-            return (is_ok, num_val)
+        if self.account_source == "cswap":
+            def sort_key_cswap(a):
+                num = a.get("number", 0)
+                num_val = int(num) if str(num).isdigit() else 9999
+                is_active = 0 if a.get("active") else 1
+                is_ok = 0 if a.get("usageStatus") == "ok" else 1
+                return (is_active, is_ok, num_val)
 
-        sorted_accs = sorted(self.cswap_accounts, key=sort_key)
-        for acc in sorted_accs:
-            num = acc.get("number")
-            is_pinned = str(num) == str(self.pinned_account)
-            lbl = format_account_label(acc, is_pinned=is_pinned)
-            item = Gtk.MenuItem(label=lbl)
-            item.connect("activate", self._make_account_selector(num))
-            self.accounts_menu.append(item)
+            sorted_accs = sorted(self.cswap_accounts, key=sort_key_cswap)
+            for acc in sorted_accs:
+                num = acc.get("number")
+                is_pinned = str(num) == str(self.pinned_account)
+                lbl = format_account_label(acc, is_pinned=is_pinned)
+                item = Gtk.MenuItem(label=lbl)
+                item.connect("activate", self._make_account_selector(num))
+                self.accounts_menu.append(item)
+        else:
+            def sort_key_standalone(a):
+                num = a.get("number", 9999)
+                num_val = int(num) if str(num).isdigit() else 9999
+                is_active = 0 if a.get("active") else 1
+                is_ok = 0 if a.get("usageStatus") == "ok" else 1
+                return (is_active, is_ok, num_val)
+
+            sorted_accs = sorted(self.standalone_accounts, key=sort_key_standalone)
+            if not sorted_accs:
+                item_none = Gtk.MenuItem(label="No accounts (Run 'claude auth login')")
+                item_none.set_sensitive(False)
+                self.accounts_menu.append(item_none)
+            else:
+                for acc in sorted_accs:
+                    acc_id = acc.get("id") or acc.get("email")
+                    is_pinned = (
+                        str(acc_id) == str(self.pinned_account)
+                        or (acc.get("number") is not None and str(acc.get("number")) == str(self.pinned_account))
+                    )
+                    lbl = format_account_label(acc, is_pinned=is_pinned)
+                    item = Gtk.MenuItem(label=lbl)
+                    item.connect("activate", self._make_standalone_account_selector(acc))
+                    self.accounts_menu.append(item)
 
         self.accounts_menu.append(Gtk.SeparatorMenuItem())
 
@@ -374,6 +545,37 @@ class ClaudeTrackerApp:
         item_follow.set_active(self.follow_cli_active)
         item_follow.connect("toggled", self._on_follow_cli_toggled)
         self.accounts_menu.append(item_follow)
+
+        self.accounts_menu.append(Gtk.SeparatorMenuItem())
+
+        # Account Source Submenu
+        curr_label = "Standalone" if self.account_source == "standalone" else "cswap"
+        source_menu_item = Gtk.MenuItem(label=f"Account Source ({curr_label})")
+        source_sub = Gtk.Menu()
+        source_menu_item.set_submenu(source_sub)
+
+        item_src_standalone = Gtk.MenuItem(
+            label="● Standalone / CLI" if self.account_source == "standalone" else "○ Standalone / CLI"
+        )
+        item_src_standalone.connect("activate", lambda _: self._set_account_source("standalone"))
+        source_sub.append(item_src_standalone)
+
+        cswap_label = "cswap"
+        if not is_cswap_installed():
+            cswap_label += " (Cache only)" if is_cswap_data_available() else " (Not installed)"
+        item_src_cswap = Gtk.MenuItem(
+            label="● " + cswap_label if self.account_source == "cswap" else "○ " + cswap_label
+        )
+        item_src_cswap.connect("activate", lambda _: self._set_account_source("cswap"))
+        source_sub.append(item_src_cswap)
+
+        self.accounts_menu.append(source_menu_item)
+
+        # Import from cswap option
+        if self.account_source == "standalone" and is_cswap_data_available():
+            item_import = Gtk.MenuItem(label="Import Accounts from cswap")
+            item_import.connect("activate", self._on_import_cswap_clicked)
+            self.accounts_menu.append(item_import)
 
         self.accounts_menu.show_all()
 
@@ -390,28 +592,62 @@ class ClaudeTrackerApp:
                 None,
             )
             if target:
-                self._display_cswap_account(target)
+                self._display_account(target)
             self._rebuild_accounts_menu()
+        return on_select
+
+    def _make_standalone_account_selector(self, target_account):
+        def on_select(_):
+            acc_id = target_account.get("id") or target_account.get("email")
+            self.pinned_account = acc_id
+            save_config({"pinned_account": self.pinned_account})
+
+            if target_account.get("credentials") and not target_account.get("active"):
+                print(f"DEBUG: Switching standalone account to {target_account.get('email')}...")
+                switch_standalone_account_async(
+                    acc_id,
+                    callback=lambda success, err: GLib.idle_add(self.refresh_data),
+                )
+            else:
+                self._display_account(target_account)
+                self._rebuild_accounts_menu()
         return on_select
 
     def _on_follow_cli_toggled(self, widget):
         self.follow_cli_active = widget.get_active()
         save_config({"follow_cli_active": self.follow_cli_active})
         if self.follow_cli_active:
-            active_acc = next((a for a in self.cswap_accounts if a.get("active")), None)
-            if active_acc:
-                self.pinned_account = active_acc.get("number")
-                save_config({"pinned_account": self.pinned_account})
-                self._display_cswap_account(active_acc)
-                self._rebuild_accounts_menu()
+            if self.account_source == "standalone":
+                active_acc = next((a for a in self.standalone_accounts if a.get("active")), None)
+                if active_acc:
+                    self.pinned_account = active_acc.get("id") or active_acc.get("email")
+                    save_config({"pinned_account": self.pinned_account})
+                    self._display_account(active_acc)
+                    self._rebuild_accounts_menu()
+            else:
+                active_acc = next((a for a in self.cswap_accounts if a.get("active")), None)
+                if active_acc:
+                    self.pinned_account = active_acc.get("number")
+                    save_config({"pinned_account": self.pinned_account})
+                    self._display_account(active_acc)
+                    self._rebuild_accounts_menu()
 
-    def _display_cswap_account(self, account):
+    def _display_account(self, account):
         num = account.get("number")
+        num_str = f"#{num}: " if num is not None else ""
         email = account.get("email", "")
         alias = account.get("alias")
-        tag = alias or f"{num}"
+        name = account.get("name")
+        display_name = alias or name
+        tag = display_name or (f"{num}" if num is not None else (email.split("@")[0] if email else "cli"))
         active_badge = " [CLI Active]" if account.get("active") else ""
-        name_str = f"{alias} ({email})" if alias else email
+        if display_name and email and display_name != email:
+            name_str = f"{display_name} ({email})"
+        elif display_name:
+            name_str = display_name
+        else:
+            name_str = email
+
         status_str = account.get("usageStatus", "ok")
         if status_str == "relogin_required":
             status_badge = " [Re-login needed]"
@@ -419,7 +655,7 @@ class ClaudeTrackerApp:
             status_badge = f" [{status_str.replace('_', ' ').title()}]"
         else:
             status_badge = ""
-        self.item_account_header.set_label(f"Account: #{num} {name_str}{status_badge}{active_badge}")
+        self.item_account_header.set_label(f"Account: {num_str}{name_str}{status_badge}{active_badge}")
         self.item_account_header.show()
 
         data = cswap_account_to_tracker_payload(account)
@@ -572,15 +808,15 @@ class ClaudeTrackerApp:
         self.last_fetch_completed = time.time()
         if error:
             print(f"DEBUG: Usage fetch error: {error}")
-            if not self.cswap_accounts:
+            if not self.cswap_accounts and not self.standalone_accounts:
                 self._safe_set_label("Auth Error")
             return
         
         if not data:
             data = {}
 
-        # Only render WebKit usage if cswap is not providing accounts
-        if not self.cswap_accounts:
+        # Only render WebKit usage if neither cswap nor standalone is providing accounts
+        if not self.cswap_accounts and not self.standalone_accounts:
             self._render_usage(data, account_tag=None)
 
 def main():

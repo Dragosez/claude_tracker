@@ -29,9 +29,19 @@ def get_cswap_binary() -> Optional[str]:
     return shutil.which("cswap")
 
 
+def is_cswap_installed() -> bool:
+    """Return True if cswap binary is installed and executable."""
+    return get_cswap_binary() is not None
+
+
+def is_cswap_data_available() -> bool:
+    """Return True if cswap data directory or cache exists on disk."""
+    return os.path.isdir(CSWAP_DIR) or os.path.exists(CSWAP_CACHE_USAGE)
+
+
 def is_cswap_available() -> bool:
-    """Return True if cswap binary or its data directory exists."""
-    return get_cswap_binary() is not None or os.path.isdir(CSWAP_DIR)
+    """Return True if cswap binary or cache exists."""
+    return is_cswap_installed() or os.path.exists(CSWAP_CACHE_USAGE)
 
 
 def fetch_cswap_accounts_sync() -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -124,7 +134,7 @@ def switch_cswap_account_async(
 
 
 def cswap_account_to_tracker_payload(account: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert a cswap account's usage to the structure expected by claude-tracker."""
+    """Convert a cswap or standalone account's usage to the structure expected by claude-tracker."""
     usage = account.get("usage") or account.get("lastGoodUsage") or {}
     five_hour = usage.get("fiveHour") or usage.get("five_hour") or {}
     seven_day = usage.get("sevenDay") or usage.get("seven_day") or {}
@@ -132,18 +142,18 @@ def cswap_account_to_tracker_payload(account: Dict[str, Any]) -> Dict[str, Any]:
 
     data: Dict[str, Any] = {
         "five_hour": {
-            "utilization": five_hour.get("pct", 0),
+            "utilization": five_hour.get("pct", 0) if "pct" in five_hour else five_hour.get("utilization", 0),
             "resets_at": five_hour.get("resetsAt") or five_hour.get("resets_at"),
             "clock": five_hour.get("clock"),
             "countdown": five_hour.get("countdown"),
         },
         "seven_day": {
-            "utilization": seven_day.get("pct", 0),
+            "utilization": seven_day.get("pct", 0) if "pct" in seven_day else seven_day.get("utilization", 0),
             "resets_at": seven_day.get("resetsAt") or seven_day.get("resets_at"),
             "clock": seven_day.get("clock"),
             "countdown": seven_day.get("countdown"),
         },
-        "limits": [],
+        "limits": list(usage.get("limits") or []),
     }
 
     for item in scoped:
@@ -209,12 +219,20 @@ def format_age(seconds: Optional[float]) -> Optional[str]:
 
 def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> str:
     """Format an account entry for display in the Accounts submenu."""
-    num = account.get("number", "?")
+    num = account.get("number")
     email = account.get("email") or ""
     alias = account.get("alias")
+    name = account.get("name")
     is_active = account.get("active", False)
 
-    name_part = f"{alias} ({email})" if alias else email
+    display_name = alias or name
+    if display_name and email and display_name != email:
+        name_part = f"{display_name} ({email})"
+    elif display_name:
+        name_part = display_name
+    else:
+        name_part = email
+
     status_str = account.get("usageStatus", "ok")
 
     pin_mark = "●" if is_pinned else "○"
@@ -228,8 +246,18 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
     if usage:
         five_h = usage.get("fiveHour") or usage.get("five_hour") or {}
         seven_d = usage.get("sevenDay") or usage.get("seven_day") or {}
-        p5 = five_h.get("pct")
-        p7 = seven_d.get("pct")
+        if "pct" in five_h:
+            p5 = five_h.get("pct")
+        else:
+            u5 = five_h.get("utilization")
+            p5 = (u5 * 100) if isinstance(u5, float) and u5 <= 1.0 else u5
+
+        if "pct" in seven_d:
+            p7 = seven_d.get("pct")
+        else:
+            u7 = seven_d.get("utilization")
+            p7 = (u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else u7
+
         if p5 is not None and p7 is not None:
             stats = f"{p5:.0f}% / {p7:.0f}%"
         elif p5 is not None:
@@ -261,4 +289,6 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
         else:
             details = "no usage"
 
-    return f"{pin_mark} #{num}: {name_part} ({details}){active_tag}"
+    if num is not None:
+        return f"{pin_mark} #{num}: {name_part} ({details}){active_tag}"
+    return f"{pin_mark} {name_part} ({details}){active_tag}"
