@@ -213,6 +213,31 @@ def save_standalone_accounts(accounts: List[Dict[str, Any]]) -> None:
         print(f"DEBUG: Failed to save standalone accounts: {e}")
 
 
+def clear_inactive_standalone_accounts() -> int:
+    """Remove all inactive accounts from standalone storage, keeping only active account(s)."""
+    accounts = load_standalone_accounts()
+    kept = [a for a in accounts if a.get("active")]
+    removed_count = len(accounts) - len(kept)
+    save_standalone_accounts(kept)
+    return removed_count
+
+
+def remove_standalone_account_sync(target_id_or_email: str) -> bool:
+    """Remove a specific standalone account by id, email, or number."""
+    accounts = load_standalone_accounts()
+    initial_len = len(accounts)
+    accounts = [
+        a for a in accounts
+        if str(a.get("id")) != str(target_id_or_email)
+        and a.get("email") != target_id_or_email
+        and (a.get("number") is None or str(a.get("number")) != str(target_id_or_email))
+    ]
+    if len(accounts) < initial_len:
+        save_standalone_accounts(accounts)
+        return True
+    return False
+
+
 def fetch_standalone_accounts_sync() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """Synchronously fetch active CLI account data and return updated accounts list."""
     accounts = load_standalone_accounts()

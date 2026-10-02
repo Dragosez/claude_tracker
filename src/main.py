@@ -42,6 +42,7 @@ from .standalone import (
     switch_standalone_account_async,
     import_cswap_accounts_async,
     load_standalone_accounts,
+    clear_inactive_standalone_accounts,
 )
 from .pace import compute_session_pace, compute_weekly_pace
 from .usage import extract_model_limits
@@ -49,7 +50,7 @@ from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 
@@ -470,6 +471,23 @@ class ClaudeTrackerApp:
         self._last_rendered_pinned = None
         self.refresh_data()
 
+    def _on_clear_inactive_clicked(self, _):
+        removed = clear_inactive_standalone_accounts()
+        def _show():
+            msg = f"Cleared {removed} inactive account(s)." if removed > 0 else "No inactive accounts to clear."
+            dialog = Gtk.MessageDialog(
+                transient_for=None,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text=msg,
+            )
+            dialog.run()
+            dialog.destroy()
+            self.refresh_data()
+            return False
+        GLib.idle_add(_show)
+
     def _on_import_cswap_clicked(self, _):
         import_cswap_accounts_async(self._on_import_cswap_completed)
 
@@ -548,34 +566,34 @@ class ClaudeTrackerApp:
 
         self.accounts_menu.append(Gtk.SeparatorMenuItem())
 
-        # Account Source Submenu
-        curr_label = "Standalone" if self.account_source == "standalone" else "cswap"
-        source_menu_item = Gtk.MenuItem(label=f"Account Source ({curr_label})")
-        source_sub = Gtk.Menu()
-        source_menu_item.set_submenu(source_sub)
-
+        # Account Source (flat items to avoid GNOME AppIndicator nested submenu sizing bug)
         item_src_standalone = Gtk.MenuItem(
-            label="● Standalone / CLI" if self.account_source == "standalone" else "○ Standalone / CLI"
+            label="● Source: Standalone (CLI)" if self.account_source == "standalone" else "○ Source: Standalone (CLI)"
         )
         item_src_standalone.connect("activate", lambda _: self._set_account_source("standalone"))
-        source_sub.append(item_src_standalone)
+        self.accounts_menu.append(item_src_standalone)
 
-        cswap_label = "cswap"
+        cswap_label = "Source: cswap"
         if not is_cswap_installed():
             cswap_label += " (Cache only)" if is_cswap_data_available() else " (Not installed)"
         item_src_cswap = Gtk.MenuItem(
             label="● " + cswap_label if self.account_source == "cswap" else "○ " + cswap_label
         )
         item_src_cswap.connect("activate", lambda _: self._set_account_source("cswap"))
-        source_sub.append(item_src_cswap)
+        self.accounts_menu.append(item_src_cswap)
 
-        self.accounts_menu.append(source_menu_item)
+        # Standalone management actions
+        if self.account_source == "standalone":
+            self.accounts_menu.append(Gtk.SeparatorMenuItem())
+            if len(self.standalone_accounts) > 1:
+                item_clear = Gtk.MenuItem(label="Clear Inactive Accounts")
+                item_clear.connect("activate", self._on_clear_inactive_clicked)
+                self.accounts_menu.append(item_clear)
 
-        # Import from cswap option
-        if self.account_source == "standalone" and is_cswap_data_available():
-            item_import = Gtk.MenuItem(label="Import Accounts from cswap")
-            item_import.connect("activate", self._on_import_cswap_clicked)
-            self.accounts_menu.append(item_import)
+            if is_cswap_data_available():
+                item_import = Gtk.MenuItem(label="Import Accounts from cswap")
+                item_import.connect("activate", self._on_import_cswap_clicked)
+                self.accounts_menu.append(item_import)
 
         self.accounts_menu.show_all()
 

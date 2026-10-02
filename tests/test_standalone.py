@@ -155,6 +155,32 @@ class TestStandaloneAccounts(unittest.TestCase):
         self.assertEqual(accs[1]["email"], "imported2@domain.com")
         self.assertEqual(accs[0]["credentials"]["claudeAiOauth"]["accessToken"], "tok_imp")
 
+    def test_clear_inactive_standalone_accounts(self):
+        accs = [
+            {"id": "1", "email": "active@domain.com", "active": True},
+            {"id": "2", "email": "inactive1@domain.com", "active": False},
+            {"id": "3", "email": "inactive2@domain.com", "active": False},
+        ]
+        standalone.save_standalone_accounts(accs)
+        removed = standalone.clear_inactive_standalone_accounts()
+        self.assertEqual(removed, 2)
+        remaining = standalone.load_standalone_accounts()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["email"], "active@domain.com")
+
+    def test_remove_standalone_account_sync(self):
+        accs = [
+            {"id": "1", "email": "acc1@domain.com", "number": 1, "active": True},
+            {"id": "2", "email": "acc2@domain.com", "number": 2, "active": False},
+        ]
+        standalone.save_standalone_accounts(accs)
+        self.assertTrue(standalone.remove_standalone_account_sync("2"))
+        remaining = standalone.load_standalone_accounts()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], "1")
+        # Removing non-existent account returns False
+        self.assertFalse(standalone.remove_standalone_account_sync("999"))
+
 
 if __name__ == "__main__":
     unittest.main()
