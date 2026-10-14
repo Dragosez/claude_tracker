@@ -76,6 +76,11 @@ class ExtractModelLimitsLegacyFormat(unittest.TestCase):
         rows = extract_model_limits(data)
         self.assertEqual(rows[0]["percent"], 42)
 
+    def test_one_percent_utilization_is_one_not_hundred(self):
+        data = {"seven_day_opus": {"utilization": 1.0, "resets_at": None}}
+        rows = extract_model_limits(data)
+        self.assertEqual(rows[0]["percent"], 1)
+
     def test_legacy_zero_utilization_hidden_except_fable_keys(self):
         data = {
             "seven_day_opus": {"utilization": 0},

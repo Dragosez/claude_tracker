@@ -25,9 +25,12 @@ def _legacy_name(key):
 
 
 def _to_percent(utilization):
-    if isinstance(utilization, float) and utilization <= 1.0:
-        return int(utilization * 100)
-    return int(utilization)
+    if utilization is None:
+        return 0
+    val = float(utilization)
+    if 0.0 < val < 1.0:
+        return int(round(val * 100))
+    return int(round(val))
 
 
 def extract_model_limits(data, fetched_at=None):

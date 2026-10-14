@@ -51,7 +51,7 @@ from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 REFRESH_INTERVAL_SECONDS = 15 * 60  # 15 minutes
@@ -701,19 +701,49 @@ class ClaudeTrackerApp:
         age_str = format_age(get_account_age_seconds(account))
         self._render_usage(data, account_tag=tag, age_str=age_str, status_str=status_str)
 
+    def _extract_percent(self, data, kind_names, fallback_dict, is_weekly=False):
+        limits = data.get("limits") or []
+        for entry in limits:
+            k = entry.get("kind") or entry.get("group")
+            if k in kind_names:
+                if is_weekly and entry.get("scope") and entry.get("scope", {}).get("model"):
+                    continue
+                val = entry.get("percent")
+                if val is not None:
+                    return int(round(float(val)))
+
+        if not fallback_dict:
+            return 0
+
+        if fallback_dict.get("percent") is not None:
+            return int(round(float(fallback_dict["percent"])))
+        if fallback_dict.get("pct") is not None:
+            return int(round(float(fallback_dict["pct"])))
+
+        util = fallback_dict.get("utilization")
+        if util is not None:
+            val = float(util)
+            if 0.0 < val < 1.0:
+                # Handle legacy fractional ratio (e.g. 0.42 -> 42%)
+                return int(round(val * 100))
+            return int(round(val))
+
+        return 0
+
     def _render_usage(self, data, account_tag=None, age_str=None, status_str="ok"):
         try:
             # 1. Current Session (5h)
             five_hour = data.get("five_hour", {})
-            util = five_hour.get("utilization", 0)
-            if util is None:
-                pct = 0
-            else:
-                pct = int(util * 100) if isinstance(util, float) and util <= 1.0 else int(util)
-            reset_str = self._format_time(five_hour.get("resets_at")) or five_hour.get("clock") or "..."
+            session_entry = next(
+                (l for l in (data.get("limits") or []) if l.get("kind") == "session" or l.get("group") == "session"),
+                None,
+            )
+            pct = self._extract_percent(data, ("session",), five_hour)
+            session_resets = (five_hour.get("resets_at") if five_hour else None) or (session_entry.get("resets_at") if session_entry else None)
+            reset_str = self._format_time(session_resets) or (five_hour.get("clock") if five_hour else None) or "..."
 
             prefix = f"[{account_tag}] " if account_tag else ""
-            if status_str == "relogin_required" and not data.get("five_hour", {}).get("resets_at"):
+            if status_str == "relogin_required" and not session_resets:
                 label = f"{prefix}Re-login needed"
             elif age_str and status_str == "relogin_required":
                 label = f"{prefix}{pct}% ({age_str})"
@@ -723,18 +753,26 @@ class ClaudeTrackerApp:
                 label = f"{prefix}{pct}%"
 
             self._safe_set_label(label)
-            pace_5h = compute_session_pace(pct, five_hour.get("resets_at"), fetched_at=self.last_fetch_completed)
+            pace_5h = compute_session_pace(pct, session_resets, fetched_at=self.last_fetch_completed)
             ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
             st_note = " [Re-login needed]" if status_str == "relogin_required" else ""
             self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else "") + st_note)
 
             # 2. All Models (Weekly)
             seven_day = data.get("seven_day", {})
-            if seven_day:
-                u7 = seven_day.get("utilization", 0)
-                p7 = int(u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else int(u7)
-                r7 = self._format_time(seven_day.get("resets_at"), include_day=True) or seven_day.get("clock")
-                pace_7d = compute_weekly_pace(p7, seven_day.get("resets_at"), fetched_at=self.last_fetch_completed)
+            weekly_entry = next(
+                (
+                    l for l in (data.get("limits") or [])
+                    if (l.get("kind") == "weekly_all" or l.get("group") == "weekly")
+                    and not (l.get("scope") and l.get("scope", {}).get("model"))
+                ),
+                None,
+            )
+            if seven_day or weekly_entry:
+                p7 = self._extract_percent(data, ("weekly_all", "weekly"), seven_day, is_weekly=True)
+                weekly_resets = (seven_day.get("resets_at") if seven_day else None) or (weekly_entry.get("resets_at") if weekly_entry else None)
+                r7 = self._format_time(weekly_resets, include_day=True) or (seven_day.get("clock") if seven_day else None)
+                pace_7d = compute_weekly_pace(p7, weekly_resets, fetched_at=self.last_fetch_completed)
                 ahead_7d = " (ahead)" if pace_7d and pace_7d.ahead else ""
                 self.item_usage_7d.set_label(f"All models (Weekly): {p7}%{ahead_7d}" + (f" ({r7})" if r7 else ""))
 

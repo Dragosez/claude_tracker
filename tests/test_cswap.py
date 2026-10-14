@@ -116,6 +116,20 @@ class TestCswapPayloadConversion(unittest.TestCase):
         label = cswap.format_account_label(acc, is_pinned=False)
         self.assertTrue(label.startswith("○ #16: account6.cc@ivfuture.uk (69% / 18%)"))
 
+    def test_format_account_one_percent_not_hundred(self):
+        acc = {
+            "number": 2,
+            "email": "user@domain.com",
+            "active": False,
+            "usage": {
+                "five_hour": {"utilization": 3.0},
+                "seven_day": {"utilization": 1.0},
+            },
+        }
+        label = cswap.format_account_label(acc, is_pinned=False)
+        self.assertIn("3% / 1%", label)
+        self.assertNotIn("100%", label)
+
     def test_format_age(self):
         self.assertIsNone(cswap.format_age(None))
         self.assertIsNone(cswap.format_age(-5))

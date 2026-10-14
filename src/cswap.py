@@ -246,17 +246,32 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
     if usage:
         five_h = usage.get("fiveHour") or usage.get("five_hour") or {}
         seven_d = usage.get("sevenDay") or usage.get("seven_day") or {}
-        if "pct" in five_h:
-            p5 = five_h.get("pct")
-        else:
-            u5 = five_h.get("utilization")
-            p5 = (u5 * 100) if isinstance(u5, float) and u5 <= 1.0 else u5
 
-        if "pct" in seven_d:
-            p7 = seven_d.get("pct")
-        else:
-            u7 = seven_d.get("utilization")
-            p7 = (u7 * 100) if isinstance(u7, float) and u7 <= 1.0 else u7
+        def _get_val(d, limits, kind):
+            for l in limits:
+                k = l.get("kind") or l.get("group")
+                if k == kind:
+                    if kind in ("weekly_all", "weekly") and l.get("scope") and l.get("scope", {}).get("model"):
+                        continue
+                    if l.get("percent") is not None:
+                        return float(l["percent"])
+            if "percent" in d and d["percent"] is not None:
+                return float(d["percent"])
+            if "pct" in d and d["pct"] is not None:
+                return float(d["pct"])
+            u = d.get("utilization")
+            if u is not None:
+                val = float(u)
+                if 0.0 < val < 1.0:
+                    return val * 100.0
+                return val
+            return None
+
+        limits = usage.get("limits") or []
+        p5 = _get_val(five_h, limits, "session")
+        p7 = _get_val(seven_d, limits, "weekly_all")
+        if p7 is None:
+            p7 = _get_val(seven_d, limits, "weekly")
 
         if p5 is not None and p7 is not None:
             stats = f"{p5:.0f}% / {p7:.0f}%"
