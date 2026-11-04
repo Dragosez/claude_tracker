@@ -51,7 +51,7 @@ from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 REFRESH_INTERVAL_SECONDS = 15 * 60  # 15 minutes
@@ -63,11 +63,13 @@ class ClaudeTrackerApp:
         self.is_fetching_standalone = False
         self.last_fetch_completed = time.time()
         self.current_label = "Login Required"
+        self._last_rendered_args = None
         
         cfg = load_config() or {}
         self.org_id = cfg.get("organization_uuid")
         self.pinned_account = cfg.get("pinned_account")
         self.follow_cli_active = cfg.get("follow_cli_active", True)
+        self.status_bar_metric = cfg.get("status_bar_metric", "auto")
         
         configured_source = cfg.get("account_source")
         if configured_source in ("standalone", "cswap"):
@@ -121,6 +123,12 @@ class ClaudeTrackerApp:
         self.accounts_menu = Gtk.Menu()
         self.item_accounts.set_submenu(self.accounts_menu)
         self.menu.append(self.item_accounts)
+
+        self.item_display_mode = Gtk.MenuItem(label="Status Bar Display")
+        self.display_mode_menu = Gtk.Menu()
+        self.item_display_mode.set_submenu(self.display_mode_menu)
+        self._rebuild_display_mode_menu()
+        self.menu.append(self.item_display_mode)
         
         self.item_select_plan = Gtk.MenuItem(label="Select Plan")
         self.plan_menu = Gtk.Menu()
@@ -725,36 +733,71 @@ class ClaudeTrackerApp:
 
         return 0
 
+    def _rebuild_display_mode_menu(self):
+        for child in self.display_mode_menu.get_children():
+            self.display_mode_menu.remove(child)
+
+        modes = [
+            ("auto", "Auto (Session if available, else Weekly)"),
+            ("session", "Current session (5h)"),
+            ("weekly", "All models (Weekly)"),
+        ]
+
+        for mode_key, mode_title in modes:
+            prefix = "● " if self.status_bar_metric == mode_key else "○ "
+            item = Gtk.MenuItem(label=prefix + mode_title)
+            item.connect("activate", self._make_display_mode_handler(mode_key))
+            self.display_mode_menu.append(item)
+
+        self.display_mode_menu.show_all()
+
+    def _make_display_mode_handler(self, mode_key):
+        def _handler(_):
+            self._set_status_bar_metric(mode_key)
+        return _handler
+
+    def _set_status_bar_metric(self, metric):
+        if self.status_bar_metric == metric:
+            return
+        self.status_bar_metric = metric
+        save_config({"status_bar_metric": metric})
+        self._rebuild_display_mode_menu()
+        if getattr(self, "_last_rendered_args", None):
+            self._render_usage(*self._last_rendered_args)
+
     def _render_usage(self, data, account_tag=None, age_str=None, status_str="ok"):
+        self._last_rendered_args = (data, account_tag, age_str, status_str)
         try:
             # 1. Current Session (5h)
-            five_hour = data.get("five_hour", {})
+            five_hour = data.get("five_hour")
+            five_hour_dict = five_hour if isinstance(five_hour, dict) else {}
             session_entry = next(
                 (l for l in (data.get("limits") or []) if l.get("kind") == "session" or l.get("group") == "session"),
                 None,
             )
-            pct = self._extract_percent(data, ("session",), five_hour)
-            session_resets = (five_hour.get("resets_at") if five_hour else None) or (session_entry.get("resets_at") if session_entry else None)
-            reset_str = self._format_time(session_resets) or (five_hour.get("clock") if five_hour else None) or "..."
+            has_session = bool(
+                session_entry
+                or (five_hour_dict and (five_hour_dict.get("resets_at") or five_hour_dict.get("utilization") is not None or five_hour_dict.get("pct") is not None))
+            )
 
-            prefix = f"[{account_tag}] " if account_tag else ""
-            if status_str == "relogin_required" and not session_resets:
-                label = f"{prefix}Re-login needed"
-            elif age_str and status_str == "relogin_required":
-                label = f"{prefix}{pct}% ({age_str})"
-            elif reset_str != "...":
-                label = f"{prefix}{pct}% ({reset_str})"
+            pct = None
+            session_resets = None
+            reset_str = None
+            if has_session:
+                pct = self._extract_percent(data, ("session",), five_hour_dict)
+                session_resets = five_hour_dict.get("resets_at") or (session_entry.get("resets_at") if session_entry else None)
+                reset_str = self._format_time(session_resets) or five_hour_dict.get("clock") or "..."
+                pace_5h = compute_session_pace(pct, session_resets, fetched_at=self.last_fetch_completed)
+                ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
+                st_note = " [Re-login needed]" if status_str == "relogin_required" else ""
+                self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else "") + st_note)
+                self.item_usage.show()
             else:
-                label = f"{prefix}{pct}%"
-
-            self._safe_set_label(label)
-            pace_5h = compute_session_pace(pct, session_resets, fetched_at=self.last_fetch_completed)
-            ahead_5h = " (ahead)" if pace_5h and pace_5h.ahead else ""
-            st_note = " [Re-login needed]" if status_str == "relogin_required" else ""
-            self.item_usage.set_label(f"Current session: {pct}%{ahead_5h}" + (f" (Resets {reset_str})" if reset_str != "..." else "") + st_note)
+                self.item_usage.hide()
 
             # 2. All Models (Weekly)
-            seven_day = data.get("seven_day", {})
+            seven_day = data.get("seven_day")
+            seven_day_dict = seven_day if isinstance(seven_day, dict) else {}
             weekly_entry = next(
                 (
                     l for l in (data.get("limits") or [])
@@ -763,15 +806,64 @@ class ClaudeTrackerApp:
                 ),
                 None,
             )
-            if seven_day or weekly_entry:
-                p7 = self._extract_percent(data, ("weekly_all", "weekly"), seven_day, is_weekly=True)
-                weekly_resets = (seven_day.get("resets_at") if seven_day else None) or (weekly_entry.get("resets_at") if weekly_entry else None)
-                r7 = self._format_time(weekly_resets, include_day=True) or (seven_day.get("clock") if seven_day else None)
+            has_weekly = bool(
+                weekly_entry
+                or (seven_day_dict and (seven_day_dict.get("resets_at") or seven_day_dict.get("utilization") is not None or seven_day_dict.get("pct") is not None))
+            )
+
+            p7 = None
+            weekly_resets = None
+            r7 = None
+            if has_weekly:
+                p7 = self._extract_percent(data, ("weekly_all", "weekly"), seven_day_dict, is_weekly=True)
+                weekly_resets = seven_day_dict.get("resets_at") or (weekly_entry.get("resets_at") if weekly_entry else None)
+                r7 = self._format_time(weekly_resets, include_day=True) or seven_day_dict.get("clock")
                 pace_7d = compute_weekly_pace(p7, weekly_resets, fetched_at=self.last_fetch_completed)
                 ahead_7d = " (ahead)" if pace_7d and pace_7d.ahead else ""
                 self.item_usage_7d.set_label(f"All models (Weekly): {p7}%{ahead_7d}" + (f" ({r7})" if r7 else ""))
+                self.item_usage_7d.show()
+            else:
+                self.item_usage_7d.hide()
 
-            # 3. Per-model usage
+            # 3. Status bar indicator label
+            use_weekly = False
+            if self.status_bar_metric == "weekly":
+                use_weekly = True
+            elif self.status_bar_metric == "session":
+                use_weekly = False
+            else:  # "auto"
+                use_weekly = not has_session
+
+            if use_weekly and has_weekly:
+                display_pct = p7 if p7 is not None else 0
+                display_reset = r7
+                has_valid_reset = bool(weekly_resets)
+            elif has_session:
+                display_pct = pct if pct is not None else 0
+                display_reset = reset_str
+                has_valid_reset = bool(session_resets)
+            elif has_weekly:
+                display_pct = p7 if p7 is not None else 0
+                display_reset = r7
+                has_valid_reset = bool(weekly_resets)
+            else:
+                display_pct = 0
+                display_reset = None
+                has_valid_reset = False
+
+            prefix = f"[{account_tag}] " if account_tag else ""
+            if status_str == "relogin_required" and not has_valid_reset:
+                label = f"{prefix}Re-login needed"
+            elif age_str and status_str == "relogin_required":
+                label = f"{prefix}{display_pct}% ({age_str})"
+            elif display_reset and display_reset != "...":
+                label = f"{prefix}{display_pct}% ({display_reset})"
+            else:
+                label = f"{prefix}{display_pct}%"
+
+            self._safe_set_label(label)
+
+            # 4. Per-model usage
             model_rows = extract_model_limits(data, fetched_at=self.last_fetch_completed)
             active_model_keys = [row["key"] for row in model_rows]
 
@@ -804,7 +896,7 @@ class ClaudeTrackerApp:
                     self.dynamic_model_items[key] = item
                     item.show()
 
-            # 4. Routine Runs
+            # 5. Routine Runs
             routines = data.get("routine_runs")
             if routines and isinstance(routines, dict):
                 curr = routines.get("current", 0)
@@ -814,7 +906,22 @@ class ClaudeTrackerApp:
             else:
                 self.item_routines.hide()
 
-            self.item_reset.set_label(f"Resets at: {reset_str}")
+            # 6. Reset time label in dropdown
+            if has_session and not use_weekly:
+                if reset_str and reset_str != "...":
+                    self.item_reset.set_label(f"Resets at: {reset_str}")
+                    self.item_reset.show()
+                else:
+                    self.item_reset.set_label("Resets at: ...")
+                    self.item_reset.show()
+            elif has_weekly:
+                if r7:
+                    self.item_reset.set_label(f"Resets at: {r7}")
+                    self.item_reset.show()
+                else:
+                    self.item_reset.hide()
+            else:
+                self.item_reset.hide()
             is_rl = status_str in ("rate_limited", "http_429")
             rl_suffix = " (rate limited)" if is_rl else ""
             if age_str:

@@ -136,23 +136,23 @@ def switch_cswap_account_async(
 def cswap_account_to_tracker_payload(account: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a cswap or standalone account's usage to the structure expected by claude-tracker."""
     usage = account.get("usage") or account.get("lastGoodUsage") or {}
-    five_hour = usage.get("fiveHour") or usage.get("five_hour") or {}
-    seven_day = usage.get("sevenDay") or usage.get("seven_day") or {}
+    raw_5h = usage.get("fiveHour") if "fiveHour" in usage else usage.get("five_hour")
+    raw_7d = usage.get("sevenDay") if "sevenDay" in usage else usage.get("seven_day")
     scoped = usage.get("scoped") or []
 
     data: Dict[str, Any] = {
         "five_hour": {
-            "utilization": five_hour.get("pct", 0) if "pct" in five_hour else five_hour.get("utilization", 0),
-            "resets_at": five_hour.get("resetsAt") or five_hour.get("resets_at"),
-            "clock": five_hour.get("clock"),
-            "countdown": five_hour.get("countdown"),
-        },
+            "utilization": raw_5h.get("pct", 0) if "pct" in raw_5h else raw_5h.get("utilization", 0),
+            "resets_at": raw_5h.get("resetsAt") or raw_5h.get("resets_at"),
+            "clock": raw_5h.get("clock"),
+            "countdown": raw_5h.get("countdown"),
+        } if raw_5h is not None else None,
         "seven_day": {
-            "utilization": seven_day.get("pct", 0) if "pct" in seven_day else seven_day.get("utilization", 0),
-            "resets_at": seven_day.get("resetsAt") or seven_day.get("resets_at"),
-            "clock": seven_day.get("clock"),
-            "countdown": seven_day.get("countdown"),
-        },
+            "utilization": raw_7d.get("pct", 0) if "pct" in raw_7d else raw_7d.get("utilization", 0),
+            "resets_at": raw_7d.get("resetsAt") or raw_7d.get("resets_at"),
+            "clock": raw_7d.get("clock"),
+            "countdown": raw_7d.get("countdown"),
+        } if raw_7d is not None else None,
         "limits": list(usage.get("limits") or []),
     }
 
@@ -277,6 +277,8 @@ def format_account_label(account: Dict[str, Any], is_pinned: bool = False) -> st
             stats = f"{p5:.0f}% / {p7:.0f}%"
         elif p5 is not None:
             stats = f"{p5:.0f}%"
+        elif p7 is not None:
+            stats = f"{p7:.0f}%"
 
     if status_str == "relogin_required":
         prefix = "Re-login needed"

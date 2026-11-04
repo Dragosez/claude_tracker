@@ -130,6 +130,33 @@ class TestCswapPayloadConversion(unittest.TestCase):
         self.assertIn("3% / 1%", label)
         self.assertNotIn("100%", label)
 
+    def test_format_account_weekly_only_ultra_plan(self):
+        acc = {
+            "number": 1,
+            "email": "ultra@domain.com",
+            "active": True,
+            "usage": {
+                "five_hour": None,
+                "seven_day": {"utilization": 4.0},
+            },
+        }
+        label = cswap.format_account_label(acc, is_pinned=False)
+        self.assertIn("(4%)", label)
+        self.assertNotIn("None", label)
+        self.assertNotIn("/", label)
+
+    def test_cswap_account_to_tracker_payload_weekly_only(self):
+        acc = {
+            "usage": {
+                "five_hour": None,
+                "seven_day": {"utilization": 4.0, "resets_at": "2026-11-10T23:00:00Z"},
+            }
+        }
+        payload = cswap.cswap_account_to_tracker_payload(acc)
+        self.assertIsNone(payload["five_hour"])
+        self.assertIsNotNone(payload["seven_day"])
+        self.assertEqual(payload["seven_day"]["utilization"], 4.0)
+
     def test_format_age(self):
         self.assertIsNone(cswap.format_age(None))
         self.assertIsNone(cswap.format_age(-5))
