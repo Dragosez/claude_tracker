@@ -57,8 +57,9 @@ Priority: optional
 Architecture: all
 Maintainer: Dragos <dragos2992@yahoo.com>
 Depends: python3, python3-gi, gir1.2-ayatanaappindicator3-0.1, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0, python3-requests
+Recommends: gir1.2-xapp-1.0
 Description: Native Linux topbar indicator for Claude.ai usage.
- Supports wide horizontal text in Ubuntu/GNOME.
+ Supports wide horizontal text in Ubuntu/GNOME and Linux Mint/Cinnamon.
 EOF
 
 echo "Building .deb package..."
