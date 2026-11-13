@@ -46,12 +46,13 @@ from .standalone import (
 )
 from .tray import create_tray
 from .pace import compute_session_pace, compute_weekly_pace
+from .status_export import export_status_file
 from .usage import extract_model_limits
 from .watchdog import is_stalled
 
 # Constants
 APP_ID = "claude-tracker"
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 RELEASES_API_URL = "https://api.github.com/repos/Dragosez/claude_tracker/releases/latest"
 ICON_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "assets", "claude-tracker-icon.png"))
 REFRESH_INTERVAL_SECONDS = 15 * 60  # 15 minutes
@@ -928,6 +929,35 @@ class ClaudeTrackerApp:
                 self.item_time.set_label(f"Last Updated: {age_str}{rl_suffix}")
             else:
                 self.item_time.set_label(f"Last Checked: {datetime.now().strftime('%H:%M')}{rl_suffix}")
+
+            # Export status.json and evaluate alert thresholds for CLI, hooks, and MCP
+            try:
+                account_meta = {}
+                standalone_accs = getattr(self, "standalone_accounts", None)
+                cswap_accs = getattr(self, "cswap_accounts", None)
+                if standalone_accs:
+                    active_acc = next((a for a in standalone_accs if a.get("active")), None)
+                    if active_acc:
+                        account_meta = {
+                            "name": active_acc.get("name") or active_acc.get("alias"),
+                            "email": active_acc.get("email"),
+                            "subscription_type": active_acc.get("subscriptionType"),
+                            "organization_name": active_acc.get("organizationName"),
+                            "active": True,
+                        }
+                elif cswap_accs and getattr(self, "selected_cswap_account", None):
+                    account_meta = {
+                        "name": self.selected_cswap_account.get("name") or self.selected_cswap_account.get("alias"),
+                        "email": self.selected_cswap_account.get("email"),
+                        "subscription_type": self.selected_cswap_account.get("subscriptionType"),
+                        "organization_name": self.selected_cswap_account.get("organizationName"),
+                        "active": True,
+                    }
+                elif account_tag:
+                    account_meta = {"name": account_tag, "active": True}
+                export_status_file(data, account_meta=account_meta, last_fetch_completed=getattr(self, "last_fetch_completed", None))
+            except Exception as se_err:
+                print(f"DEBUG: Status export error: {se_err}")
         except Exception as e:
             print(f"DEBUG: UI update error: {e}")
 

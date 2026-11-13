@@ -380,6 +380,12 @@ def fetch_standalone_accounts_sync(force: bool = False) -> Tuple[List[Dict[str, 
             a["active"] = False
 
     save_standalone_accounts(accounts)
+    try:
+        from .status_export import export_status_file
+        if effective_usage:
+            export_status_file(effective_usage, account_meta=active_acc, last_fetch_completed=fetched_at)
+    except Exception as e:
+        print(f"DEBUG: Failed to export status from standalone: {e}")
     return accounts, None
 
 
